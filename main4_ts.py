@@ -1162,9 +1162,9 @@ def get_machine_orders_from_start_times(op_start_times, jsp_instance):
             machine_orders[machine].append((job, op))
 
     for machine in range(m):
-        machine_orders[machine].sort(
-            key=lambda x: (op_start_times[x[0]][x[1]], x[0], x[1])
-        )
+        order = machine_orders[machine]
+        order.sort(key=lambda x: op_start_times[x[0]][x[1]])
+        machine_orders[machine] = order
     return machine_orders
 
 
@@ -1186,26 +1186,20 @@ def schedule_from_machine_orders(jsp_instance, machine_orders):
     while len(scheduled) < total_ops:
         progress = False
         for machine in range(m):
+            assert type(machine) == int, f"machine should be int, but got {type(machine)} for machine {machine}"
+            assert type(machine_idx) == list, f"machine_idx should be list, but got {type(machine_idx)}"
+            assert type(machine_idx[machine]) == int, f"machine_idx should be int, but got {type(machine_idx[machine])} for machine {machine}"
             idx = machine_idx[machine]
             if idx >= len(machine_orders[machine]):
                 continue
 
-            job, op = machine_orders[machine][idx]
+            job, op = (machine_orders[machine])[idx]
             if op > 0 and (job, op - 1) not in scheduled:
                 continue
             
-            import builtins
-            try:
-                start_time = max(job_ready[job], machine_ready[machine])
-                op_start_times[job][op] = start_time
-                end_time = start_time + duration[job][op]
-            except Exception as e:
-                print("max is builtins.max:", max is builtins.max)
-                print("type(job_ready[job]) =", type(job_ready[job]), job_ready[job])
-                print("type(machine_ready[machine]) =", type(machine_ready[machine]), machine_ready[machine])
-                start_time = builtins.max(job_ready[job], machine_ready[machine])
-                op_start_times[job][op] = start_time
-                end_time = start_time + duration[job][op]
+            start_time = max(job_ready[job], machine_ready[machine])
+            op_start_times[job][op] = start_time
+            end_time = start_time + duration[job][op]
 
             job_ready[job] = end_time
             machine_ready[machine] = end_time
@@ -1236,16 +1230,16 @@ def extract_critical_path(op_start_times, duration, mch):
         for op in range(m):
             machine_seq[mch[job][op]].append((job, op))
     for machine in range(m):
-        machine_seq[machine].sort(
-            key=lambda x: (op_start_times[x[0]][x[1]], x[0], x[1])
-        )
+        order = machine_seq[machine]
+        order.sort(key=lambda x: op_start_times[x[0]][x[1]])
+        machine_seq[machine] = order
 
     makespan = max(finish[job][m - 1] for job in range(j))
     end_ops = [(job, m - 1) for job in range(j) if finish[job][m - 1] == makespan]
     if not end_ops:
         return []
 
-    current = min(end_ops, key=lambda x: (op_start_times[x[0]][x[1]], x[0], x[1]))
+    current = random.choice(end_ops)
     path = [current]
 
     while True:
@@ -1261,23 +1255,23 @@ def extract_critical_path(op_start_times, duration, mch):
 
         machine = mch[job][op]
         machine_ops = machine_seq[machine]
-        idx = machine_ops.index(current)
+        #idx = machine_ops.index(current)
+        idx = 0
+        for job_, op_ in machine_ops:
+            if (job_, op_) == current:
+                break
+            idx += 1
+
         if idx > 0:
             prev_machine_op = machine_ops[idx - 1]
-            prev_finish = (
-                op_start_times[prev_machine_op[0]][prev_machine_op[1]]
-                + duration[prev_machine_op[0]][prev_machine_op[1]]
-            )
+            prev_finish = op_start_times[prev_machine_op[0]][prev_machine_op[1]] + duration[prev_machine_op[0]][prev_machine_op[1]]
             if prev_finish == start_time:
                 candidates.append(prev_machine_op)
 
         if not candidates:
             break
 
-        current = min(
-            candidates,
-            key=lambda x: (op_start_times[x[0]][x[1]], x[0], x[1])
-        )
+        current = random.choice(candidates)
         path.append(current)
 
     path.reverse()
@@ -1325,9 +1319,10 @@ def _generate_n5_neighbors(jsp_instance, op_start_times):
 
     machine_orders = get_machine_orders_from_start_times(op_start_times, jsp_instance)
     op_pos = {}
-    for machine, order in enumerate(machine_orders):
+    for machine in range(len(machine_orders)):
+        order = machine_orders[machine]
         for idx, op in enumerate(order):
-            op_pos[op] = (machine, idx)
+            op_pos[(op[0], op[1])] = (machine, idx)
 
     neighbors = []
     seen_pairs = set()
@@ -1345,7 +1340,7 @@ def _generate_n5_neighbors(jsp_instance, op_start_times):
             if machine_orders[machine][idx + 1] != second:
                 continue
 
-            move_key = (machine, first, second)
+            move_key = (first, second)
             if move_key in seen_pairs:
                 continue
             seen_pairs.add(move_key)
@@ -1366,7 +1361,7 @@ def _generate_n5_neighbors(jsp_instance, op_start_times):
                 "machine": machine,
                 "swap": (first, second),
                 "move_key": move_key,
-                "tabu_key": (machine, second, first),
+                "tabu_key": (second, first),
                 "start_times": cand_start_times,
                 "makespan": cand_makespan,
             })
@@ -1480,8 +1475,8 @@ if __name__ == "__main__":
     st = time()
 
     pdr = PDR(priority=SPT())
-    start_var = 1
-    end_var = 80
+    start_var = 61
+    end_var = 70
     count = 0
     for jsp_dataset in dataset:
         count += 1
@@ -1498,7 +1493,7 @@ if __name__ == "__main__":
             jsp_dataset,
             op_start_times,
             max_iterations=5000,
-            tabu_tenure=10,
+            tabu_tenure=20,
             max_no_improve=None,
             debug=False,
         )
