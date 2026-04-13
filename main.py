@@ -832,4 +832,4 @@ def plot():
         "names": data_file
     }
     plot_gantt(op_start_times, jsp_dataset, 
-               title=f"(makespan={:.1f})")
+               title=f"(makespan={makespan:.1f})")
