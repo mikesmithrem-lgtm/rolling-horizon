@@ -911,7 +911,7 @@ def large_neiborhood_search(
             best_solution = [row[:] for row in op_start_times]
             best_makespan = makespan
             # DEBUG: 仅在特定实例上打印改进信息
-            print(f"Iteration {it}: Found better solution with makespan {best_makespan}")
+            # print(f"Iteration {it}: Found better solution with makespan {best_makespan}")
             if debug == 'all_windows':
                 print(f"Iteration {it}: Found better solution with makespan {best_makespan}, total windows is {total_windows}, "
                       f"prefix windows is {window_idx // window_size}, suffix windows is {(nopr - window_idx) // window_size}")
@@ -1019,7 +1019,7 @@ if __name__ == "__main__":
                                                                    op_start_times, 
                                                                    use_multi_window=False,
                                                                    window_size=window_size, 
-                                                                   max_iterations=500, 
+                                                                   max_iterations=50, 
                                                                    debug="single_windows",
                                                                    cp_mode=False)
         # print("调度结果开始时间：")

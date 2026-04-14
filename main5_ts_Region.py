@@ -630,7 +630,211 @@ def tabu_search_n5(
     return best_start, best_makespan
 
 
+def tabu_search_n5_region(
+    jsp_instance,
+    est,
+    window_size=20,
+    max_iterations=200,
+    local_iterations=50,
+    tabu_tenure=None,
+    max_no_improve=None,
+    debug=False,
+):
+    """
+    基于时间窗口（按开始时间排序的操作序列划分窗口） 的区域化 N5 禁忌搜索。
+
+    思路：将所有操作按初始开始时间排序，滑动窗口选择一组操作作为子问题。
+    在子问题内仅生成和接受涉及窗口内操作的 N5 邻域（即限制移动），使用 N5-TS 在该子问题上局部搜索，
+    然后将局部改进合并到全局调度中，继续下一个窗口或重复多次以逐步改进全局解。
+
+    参数：
+        jsp_instance: JSSP 实例（字典）
+        est: 初始开始时间矩阵 (j x m)
+        window_size: 窗口包含的操作数量（按开始时间排序的扁平操作序列）
+        max_iterations: 在不同窗口上尝试的全局迭代次数
+        local_iterations: 每个窗口内的本地禁忌搜索迭代次数
+        tabu_tenure, max_no_improve, debug: 传递给局部TS的参数含义类似 tabu_search_n5
+
+    返回:
+        best_start_times, best_makespan
+    """
+    # 归一化副本
+    jsp_instance, est = _normalize_jsp_instance_for_tabu(jsp_instance, est)
+    j, m = jsp_instance["j"], jsp_instance["m"]
+    duration = jsp_instance["duration"]
+
+    # 扁平操作列表，按开始时间排序
+    all_ops = [(job, op) for job in range(j) for op in range(m)]
+    op_start_flat = {op: est[op[0]][op[1]] for op in all_ops}
+    sorted_ops = sorted(all_ops, key=lambda x: op_start_flat[x])
+    nopr = len(sorted_ops)
+    if nopr <= window_size:
+        # Window covers all ops，直接用已有的全局TS
+        return tabu_search_n5(jsp_instance, est, max_iterations=max_iterations, tabu_tenure=tabu_tenure, max_no_improve=max_no_improve, debug=debug)
+
+    current_start = [row[:] for row in est]
+    current_makespan = max(current_start[job][m - 1] + duration[job][m - 1] for job in range(j))
+    best_start = [row[:] for row in current_start]
+    best_makespan = current_makespan
+
+    # helper: 仅生成涉及 allowed_ops 的 N5 邻域
+    def _generate_n5_neighbors_region(jsp_instance, op_start_times, allowed_set):
+        duration = jsp_instance["duration"]
+        mch = jsp_instance["mch"]
+
+        crit_path = extract_critical_path(op_start_times, duration, mch)
+        blocks = split_critical_blocks(crit_path, mch)
+        if not blocks:
+            return []
+
+        machine_orders = get_machine_orders_from_start_times(op_start_times, jsp_instance)
+        op_pos = {}
+        for machine in range(len(machine_orders)):
+            order = machine_orders[machine]
+            for idx, op in enumerate(order):
+                op_pos[(op[0], op[1])] = (machine, idx)
+
+        neighbors = []
+        seen_pairs = set()
+        for block in blocks:
+            candidate_pairs = [(block[0], block[1])]
+            if len(block) > 2:
+                candidate_pairs.append((block[-2], block[-1]))
+
+            for first, second in candidate_pairs:
+                # 仅考虑移动对均在窗口允许集合中的情况
+                if first not in allowed_set or second not in allowed_set:
+                    continue
+
+                machine, idx = op_pos[first]
+                if op_pos[second][0] != machine:
+                    continue
+                if idx + 1 >= len(machine_orders[machine]):
+                    continue
+                if machine_orders[machine][idx + 1] != second:
+                    continue
+
+                move_key = (first, second)
+                if move_key in seen_pairs:
+                    continue
+                seen_pairs.add(move_key)
+
+                new_orders = [order[:] for order in machine_orders]
+                new_orders[machine][idx], new_orders[machine][idx + 1] = (
+                    new_orders[machine][idx + 1],
+                    new_orders[machine][idx],
+                )
+
+                cand_start_times, cand_makespan = schedule_from_machine_orders(
+                    jsp_instance, new_orders
+                )
+                if cand_start_times is None:
+                    continue
+
+                neighbors.append({
+                    "machine": machine,
+                    "swap": (first, second),
+                    "move_key": move_key,
+                    "tabu_key": (second, first),
+                    "start_times": cand_start_times,
+                    "makespan": cand_makespan,
+                })
+
+        return neighbors
+
+    # 全局循环：在不同窗口上进行局部TS
+    windows = []
+    # 生成窗口起始索引（不重叠滑动窗口）
+    for start_idx in range(0, nopr, window_size):
+        end_idx = min(start_idx + window_size, nopr)
+        windows.append((start_idx, end_idx))
+
+    # 全局 tabu map 保留跨窗口禁忌（可选）
+    tabu_until = {}
+
+    global_it = 0
+    no_improve_rounds = 0
+    if max_no_improve is None:
+        max_no_improve = max_iterations
+
+    while global_it < max_iterations:
+        improved_in_cycle = False
+        # 轮询每个窗口
+        for (start_idx, end_idx) in windows:
+            allowed_ops = set(sorted_ops[start_idx:end_idx])
+
+            # 在该窗口内进行本地TS若干次
+            local_iter = 0
+            local_no_improve = 0
+            if tabu_tenure is None:
+                local_tenure = max(5, min(10, (j * m) // 10 + 1))
+            else:
+                local_tenure = tabu_tenure
+
+            while local_iter < local_iterations:
+                neighbors = _generate_n5_neighbors_region(jsp_instance, current_start, allowed_ops)
+                if not neighbors:
+                    break
+
+                best_candidate = None
+                best_fallback = None
+                for candidate in neighbors:
+                    if best_fallback is None or candidate["makespan"] < best_fallback["makespan"]:
+                        best_fallback = candidate
+
+                    is_tabu = tabu_until.get(candidate["move_key"], 0) > (global_it * local_iterations + local_iter)
+                    if is_tabu and candidate["makespan"] >= best_makespan:
+                        continue
+
+                    if best_candidate is None or candidate["makespan"] < best_candidate["makespan"]:
+                        best_candidate = candidate
+
+                if not neighbors:
+                    break
+
+                chosen = best_candidate if best_candidate is not None else best_fallback
+                if chosen is None:
+                    break
+
+                current_start = [row[:] for row in chosen["start_times"]]
+                current_makespan = chosen["makespan"]
+                tabu_until[chosen["tabu_key"]] = (global_it * local_iterations + local_iter) + local_tenure
+
+                if current_makespan < best_makespan:
+                    best_start = [row[:] for row in current_start]
+                    best_makespan = current_makespan
+                    local_no_improve = 0
+                    improved_in_cycle = True
+                    if debug:
+                        print(
+                            f"[TS-N5-REGION] global_it={global_it}, window=({start_idx},{end_idx}), local_iter={local_iter}, machine={chosen['machine']}, swap={chosen['swap']}, best_makespan={best_makespan}"
+                        )
+                else:
+                    local_no_improve += 1
+
+                local_iter += 1
+                if local_no_improve >= local_iterations:
+                    break
+
+            # end local window search
+            global_it += 1
+            if global_it >= max_iterations:
+                break
+
+        # end windows loop
+        if not improved_in_cycle:
+            no_improve_rounds += 1
+        else:
+            no_improve_rounds = 0
+
+        if no_improve_rounds >= max_no_improve:
+            break
+
+    return best_start, best_makespan
+
+
 if __name__ == "__main__":
+
     dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
     gaps = ObjMeter()
     better_gaps = ObjMeter()
