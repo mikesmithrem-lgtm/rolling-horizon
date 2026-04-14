@@ -532,6 +532,294 @@ def _generate_n5_neighbors(jsp_instance, op_start_times):
     return neighbors
 
 
+def _build_region_subproblem(jsp_instance, op_start_times, seed_ops):
+    duration = jsp_instance["duration"]
+    mch = jsp_instance["mch"]
+    machine_orders = get_machine_orders_from_start_times(op_start_times, jsp_instance)
+
+    finish_times = {}
+    seed_by_machine = defaultdict(list)
+    for job, op in seed_ops:
+        finish_times[(job, op)] = op_start_times[job][op] + duration[job][op]
+        seed_by_machine[mch[job][op]].append((job, op))
+
+    if not seed_by_machine:
+        return None
+
+    machine_windows = {}
+    for machine, ops in seed_by_machine.items():
+        earliest = min(op_start_times[job][op] for job, op in ops)
+        latest = max(finish_times[(job, op)] for job, op in ops)
+        machine_windows[machine] = (earliest, latest)
+
+    region_machine_orders = {}
+    segment_bounds = {}
+    region_ops = set()
+
+    for machine, (window_start, window_end) in machine_windows.items():
+        order = machine_orders[machine]
+        region_indices = [
+            idx
+            for idx, (job, op) in enumerate(order)
+            if op_start_times[job][op] >= window_start
+            and op_start_times[job][op] + duration[job][op] <= window_end
+        ]
+        if not region_indices:
+            continue
+
+        first_idx = min(region_indices)
+        last_idx = max(region_indices) + 1
+        region_order = order[first_idx:last_idx]
+        if not region_order:
+            continue
+
+        region_machine_orders[machine] = region_order
+        segment_bounds[machine] = (first_idx, last_idx)
+        region_ops.update(region_order)
+
+    if not region_ops:
+        return None
+
+    all_finish_times = {
+        (job, op): op_start_times[job][op] + duration[job][op]
+        for job in range(jsp_instance["j"])
+        for op in range(jsp_instance["m"])
+    }
+    base_start = min(
+        op_start_times[order[0][0]][order[0][1]]
+        for order in region_machine_orders.values()
+    )
+
+    machine_release = {
+        machine: op_start_times[order[0][0]][order[0][1]] - base_start
+        for machine, order in region_machine_orders.items()
+    }
+    external_release = {}
+    for job, op in region_ops:
+        if op == 0:
+            external_release[(job, op)] = 0
+            continue
+
+        pred = (job, op - 1)
+        if pred in region_ops:
+            continue
+
+        external_release[(job, op)] = max(0, all_finish_times[pred] - base_start)
+
+    local_makespan = max(all_finish_times[op] - base_start for op in region_ops)
+    return {
+        "region_ops": region_ops,
+        "machine_orders": region_machine_orders,
+        "segment_bounds": segment_bounds,
+        "machine_release": machine_release,
+        "external_release": external_release,
+        "base_start": base_start,
+        "local_makespan": local_makespan,
+    }
+
+
+def _schedule_region_from_machine_orders(
+    jsp_instance,
+    machine_orders,
+    region_ops,
+    machine_release,
+    external_release,
+):
+    duration = jsp_instance["duration"]
+
+    op_start_times = {}
+    finish_times = {}
+    machine_ready = {
+        machine: machine_release.get(machine, 0) for machine in machine_orders
+    }
+    machine_idx = {machine: 0 for machine in machine_orders}
+    scheduled = set()
+    total_ops = len(region_ops)
+
+    while len(scheduled) < total_ops:
+        progress = False
+        for machine in sorted(machine_orders):
+            idx = machine_idx[machine]
+            order = machine_orders[machine]
+            if idx >= len(order):
+                continue
+
+            job, op = order[idx]
+            if op > 0:
+                pred = (job, op - 1)
+                if pred in region_ops:
+                    if pred not in scheduled:
+                        continue
+                    job_ready = finish_times[pred]
+                else:
+                    job_ready = external_release.get((job, op), 0)
+            else:
+                job_ready = 0
+
+            start_time = max(job_ready, machine_ready[machine])
+            finish_time = start_time + duration[job][op]
+
+            op_start_times[(job, op)] = start_time
+            finish_times[(job, op)] = finish_time
+            machine_ready[machine] = finish_time
+            machine_idx[machine] += 1
+            scheduled.add((job, op))
+            progress = True
+
+        if not progress:
+            return None, None
+
+    makespan = max(finish_times.values()) if finish_times else 0
+    return op_start_times, makespan
+
+
+def _extract_critical_path_region(
+    jsp_instance,
+    region_start_times,
+    machine_orders,
+    region_ops,
+):
+    duration = jsp_instance["duration"]
+    mch = jsp_instance["mch"]
+
+    if not region_start_times:
+        return []
+
+    finish_times = {
+        op: region_start_times[op] + duration[op[0]][op[1]]
+        for op in region_ops
+    }
+    makespan = max(finish_times.values())
+    end_ops = [op for op in region_ops if finish_times[op] == makespan]
+    if not end_ops:
+        return []
+
+    op_pos = {}
+    for machine, order in machine_orders.items():
+        for idx, op in enumerate(order):
+            op_pos[op] = (machine, idx)
+
+    current = random.choice(end_ops)
+    path = [current]
+    while True:
+        job, op = current
+        start_time = region_start_times[current]
+        candidates = []
+
+        if op > 0:
+            pred = (job, op - 1)
+            if pred in region_ops and finish_times[pred] == start_time:
+                candidates.append(pred)
+
+        machine, idx = op_pos[current]
+        if idx > 0:
+            pred = machine_orders[machine][idx - 1]
+            if finish_times[pred] == start_time:
+                candidates.append(pred)
+
+        if not candidates:
+            break
+
+        current = random.choice(candidates)
+        path.append(current)
+
+    path.reverse()
+    return path
+
+
+def _generate_n5_neighbors_region(jsp_instance, region_info):
+    mch = jsp_instance["mch"]
+    region_ops = region_info["region_ops"]
+    machine_orders = region_info["machine_orders"]
+
+    region_start_times, _ = _schedule_region_from_machine_orders(
+        jsp_instance,
+        machine_orders,
+        region_ops,
+        region_info["machine_release"],
+        region_info["external_release"],
+    )
+    if region_start_times is None:
+        return []
+
+    crit_path = _extract_critical_path_region(
+        jsp_instance,
+        region_start_times,
+        machine_orders,
+        region_ops,
+    )
+    blocks = split_critical_blocks(crit_path, mch)
+    if not blocks:
+        return []
+
+    op_pos = {}
+    for machine, order in machine_orders.items():
+        for idx, op in enumerate(order):
+            op_pos[op] = (machine, idx)
+
+    neighbors = []
+    seen_pairs = set()
+    for block in blocks:
+        candidate_pairs = [(block[0], block[1])]
+        if len(block) > 2:
+            candidate_pairs.append((block[-2], block[-1]))
+
+        for first, second in candidate_pairs:
+            machine, idx = op_pos[first]
+            if op_pos[second][0] != machine:
+                continue
+            if idx + 1 >= len(machine_orders[machine]):
+                continue
+            if machine_orders[machine][idx + 1] != second:
+                continue
+
+            move_key = (first, second)
+            if move_key in seen_pairs:
+                continue
+            seen_pairs.add(move_key)
+
+            new_orders = {
+                machine_id: order[:]
+                for machine_id, order in machine_orders.items()
+            }
+            new_orders[machine][idx], new_orders[machine][idx + 1] = (
+                new_orders[machine][idx + 1],
+                new_orders[machine][idx],
+            )
+
+            cand_region_start, cand_region_makespan = _schedule_region_from_machine_orders(
+                jsp_instance,
+                new_orders,
+                region_ops,
+                region_info["machine_release"],
+                region_info["external_release"],
+            )
+            if cand_region_start is None:
+                continue
+
+            neighbors.append({
+                "machine": machine,
+                "swap": (first, second),
+                "move_key": move_key,
+                "tabu_key": (second, first),
+                "machine_orders": new_orders,
+                "region_start_times": cand_region_start,
+                "region_makespan": cand_region_makespan,
+            })
+
+    return neighbors
+
+
+def _merge_region_machine_orders(global_machine_orders, region_info, region_machine_orders):
+    merged_orders = [order[:] for order in global_machine_orders]
+    for machine, (start_idx, end_idx) in region_info["segment_bounds"].items():
+        replacement = region_machine_orders[machine]
+        if end_idx - start_idx != len(replacement):
+            return None
+        merged_orders[machine][start_idx:end_idx] = replacement
+    return merged_orders
+
+
 def tabu_search_n5(
     jsp_instance,
     est,
@@ -633,7 +921,7 @@ def tabu_search_n5(
 def tabu_search_n5_region(
     jsp_instance,
     est,
-    window_size=20,
+    window_size=160,
     max_iterations=200,
     local_iterations=50,
     tabu_tenure=None,
@@ -643,9 +931,11 @@ def tabu_search_n5_region(
     """
     基于时间窗口（按开始时间排序的操作序列划分窗口） 的区域化 N5 禁忌搜索。
 
-    思路：将所有操作按初始开始时间排序，滑动窗口选择一组操作作为子问题。
-    在子问题内仅生成和接受涉及窗口内操作的 N5 邻域（即限制移动），使用 N5-TS 在该子问题上局部搜索，
-    然后将局部改进合并到全局调度中，继续下一个窗口或重复多次以逐步改进全局解。
+    思路：将所有操作按当前开始时间排序，滑动窗口选择一组种子操作。
+    对这些种子操作所在机器，提取该窗口内的最早开始与最晚结束时间，形成机器局部时间段；
+    再将每台机器的局部起点对齐到统一时间原点，并用虚拟起始段表示机器在局部窗口前的等待时间。
+    在这个对齐后的局部子问题上提取关键路径和关键块，忽略虚拟节点，只生成可交换的 N5 邻域；
+    使用窗口局部 makespan 作为本地搜索目标，并将局部最优移动回填到全局调度中评估最终 makespan 变化。
 
     参数：
         jsp_instance: JSSP 实例（字典）
@@ -665,9 +955,7 @@ def tabu_search_n5_region(
 
     # 扁平操作列表，按开始时间排序
     all_ops = [(job, op) for job in range(j) for op in range(m)]
-    op_start_flat = {op: est[op[0]][op[1]] for op in all_ops}
-    sorted_ops = sorted(all_ops, key=lambda x: op_start_flat[x])
-    nopr = len(sorted_ops)
+    nopr = len(all_ops)
     if nopr <= window_size:
         # Window covers all ops，直接用已有的全局TS
         return tabu_search_n5(jsp_instance, est, max_iterations=max_iterations, tabu_tenure=tabu_tenure, max_no_improve=max_no_improve, debug=debug)
@@ -676,78 +964,6 @@ def tabu_search_n5_region(
     current_makespan = max(current_start[job][m - 1] + duration[job][m - 1] for job in range(j))
     best_start = [row[:] for row in current_start]
     best_makespan = current_makespan
-
-    # helper: 仅生成涉及 allowed_ops 的 N5 邻域
-    def _generate_n5_neighbors_region(jsp_instance, op_start_times, allowed_set):
-        duration = jsp_instance["duration"]
-        mch = jsp_instance["mch"]
-
-        crit_path = extract_critical_path(op_start_times, duration, mch)
-        blocks = split_critical_blocks(crit_path, mch)
-        if not blocks:
-            return []
-
-        machine_orders = get_machine_orders_from_start_times(op_start_times, jsp_instance)
-        op_pos = {}
-        for machine in range(len(machine_orders)):
-            order = machine_orders[machine]
-            for idx, op in enumerate(order):
-                op_pos[(op[0], op[1])] = (machine, idx)
-
-        neighbors = []
-        seen_pairs = set()
-        for block in blocks:
-            candidate_pairs = [(block[0], block[1])]
-            if len(block) > 2:
-                candidate_pairs.append((block[-2], block[-1]))
-
-            for first, second in candidate_pairs:
-                # 仅考虑移动对均在窗口允许集合中的情况
-                if first not in allowed_set or second not in allowed_set:
-                    continue
-
-                machine, idx = op_pos[first]
-                if op_pos[second][0] != machine:
-                    continue
-                if idx + 1 >= len(machine_orders[machine]):
-                    continue
-                if machine_orders[machine][idx + 1] != second:
-                    continue
-
-                move_key = (first, second)
-                if move_key in seen_pairs:
-                    continue
-                seen_pairs.add(move_key)
-
-                new_orders = [order[:] for order in machine_orders]
-                new_orders[machine][idx], new_orders[machine][idx + 1] = (
-                    new_orders[machine][idx + 1],
-                    new_orders[machine][idx],
-                )
-
-                cand_start_times, cand_makespan = schedule_from_machine_orders(
-                    jsp_instance, new_orders
-                )
-                if cand_start_times is None:
-                    continue
-
-                neighbors.append({
-                    "machine": machine,
-                    "swap": (first, second),
-                    "move_key": move_key,
-                    "tabu_key": (second, first),
-                    "start_times": cand_start_times,
-                    "makespan": cand_makespan,
-                })
-
-        return neighbors
-
-    # 全局循环：在不同窗口上进行局部TS
-    windows = []
-    # 生成窗口起始索引（不重叠滑动窗口）
-    for start_idx in range(0, nopr, window_size):
-        end_idx = min(start_idx + window_size, nopr)
-        windows.append((start_idx, end_idx))
 
     # 全局 tabu map 保留跨窗口禁忌（可选）
     tabu_until = {}
@@ -759,9 +975,22 @@ def tabu_search_n5_region(
 
     while global_it < max_iterations:
         improved_in_cycle = False
+        op_start_flat = {op: current_start[op[0]][op[1]] for op in all_ops}
+        sorted_ops = sorted(all_ops, key=lambda x: op_start_flat[x])
+        # windows = [
+        #     (start_idx, min(start_idx + window_size, nopr))
+        #     for start_idx in range(0, nopr, window_size)
+        # ]
+        start_idx = random.randint(0, nopr - window_size)
+        windows = [
+            (start_idx, min(start_idx + window_size, nopr))
+        ]
+
         # 轮询每个窗口
         for (start_idx, end_idx) in windows:
-            allowed_ops = set(sorted_ops[start_idx:end_idx])
+            seed_ops = sorted_ops[start_idx:end_idx]
+            if not seed_ops:
+                continue
 
             # 在该窗口内进行本地TS若干次
             local_iter = 0
@@ -772,33 +1001,90 @@ def tabu_search_n5_region(
                 local_tenure = tabu_tenure
 
             while local_iter < local_iterations:
-                neighbors = _generate_n5_neighbors_region(jsp_instance, current_start, allowed_ops)
-                if not neighbors:
+                region_info = _build_region_subproblem(
+                    jsp_instance,
+                    current_start,
+                    seed_ops,
+                )
+                if region_info is None or len(region_info["region_ops"]) < 2:
+                    if debug:
+                        print(
+                            f"[TS-N5-REGION] window=({start_idx},{end_idx}) has no valid aligned subproblem"
+                        )
                     break
 
+                region_baseline = region_info["local_makespan"]
+                neighbors = _generate_n5_neighbors_region(jsp_instance, region_info)
+                if not neighbors:
+                    if debug:
+                        print(
+                            f"[TS-N5-REGION] window=({start_idx},{end_idx}) has no swappable N5 neighbors"
+                        )
+                    break
+
+                current_machine_orders = get_machine_orders_from_start_times(
+                    current_start,
+                    jsp_instance,
+                )
                 best_candidate = None
                 best_fallback = None
                 for candidate in neighbors:
-                    if best_fallback is None or candidate["makespan"] < best_fallback["makespan"]:
-                        best_fallback = candidate
-
-                    is_tabu = tabu_until.get(candidate["move_key"], 0) > (global_it * local_iterations + local_iter)
-                    if is_tabu and candidate["makespan"] >= best_makespan:
+                    merged_orders = _merge_region_machine_orders(
+                        current_machine_orders,
+                        region_info,
+                        candidate["machine_orders"],
+                    )
+                    if merged_orders is None:
                         continue
 
-                    if best_candidate is None or candidate["makespan"] < best_candidate["makespan"]:
-                        best_candidate = candidate
+                    cand_start_times, cand_makespan = schedule_from_machine_orders(
+                        jsp_instance,
+                        merged_orders,
+                    )
+                    if cand_start_times is None:
+                        continue
 
-                if not neighbors:
+                    enriched_candidate = dict(candidate)
+                    enriched_candidate["start_times"] = cand_start_times
+                    enriched_candidate["makespan"] = cand_makespan
+
+                    if (
+                        best_fallback is None
+                        or enriched_candidate["region_makespan"] < best_fallback["region_makespan"]
+                        or (
+                            enriched_candidate["region_makespan"] == best_fallback["region_makespan"]
+                            and enriched_candidate["makespan"] < best_fallback["makespan"]
+                        )
+                    ):
+                        best_fallback = enriched_candidate
+
+                    step = global_it * max(1, local_iterations) + local_iter
+                    is_tabu = tabu_until.get(enriched_candidate["move_key"], 0) > step
+                    if is_tabu and enriched_candidate["region_makespan"] >= region_baseline:
+                        continue
+
+                    if (
+                        best_candidate is None
+                        or enriched_candidate["region_makespan"] < best_candidate["region_makespan"]
+                        or (
+                            enriched_candidate["region_makespan"] == best_candidate["region_makespan"]
+                            and enriched_candidate["makespan"] < best_candidate["makespan"]
+                        )
+                    ):
+                        best_candidate = enriched_candidate
+
+                if best_fallback is None:
                     break
 
                 chosen = best_candidate if best_candidate is not None else best_fallback
                 if chosen is None:
                     break
 
+                previous_makespan = current_makespan
                 current_start = [row[:] for row in chosen["start_times"]]
                 current_makespan = chosen["makespan"]
-                tabu_until[chosen["tabu_key"]] = (global_it * local_iterations + local_iter) + local_tenure
+                step = global_it * max(1, local_iterations) + local_iter
+                tabu_until[chosen["tabu_key"]] = step + local_tenure
 
                 if current_makespan < best_makespan:
                     best_start = [row[:] for row in current_start]
@@ -807,10 +1093,30 @@ def tabu_search_n5_region(
                     improved_in_cycle = True
                     if debug:
                         print(
-                            f"[TS-N5-REGION] global_it={global_it}, window=({start_idx},{end_idx}), local_iter={local_iter}, machine={chosen['machine']}, swap={chosen['swap']}, best_makespan={best_makespan}"
+                            f"[TS-N5-REGION] global_it={global_it}, "
+                            f"window=({start_idx},{end_idx}), "
+                            f"local_iter={local_iter}, "
+                            f"machine={chosen['machine']}, "
+                            f"swap={chosen['swap']}, "
+                            f"region_makespan={region_baseline}->{chosen['region_makespan']}, "
+                            f"global_makespan={previous_makespan}->{current_makespan}, "
+                            f"best_makespan={best_makespan}"
                         )
                 else:
-                    local_no_improve += 1
+                    if chosen["region_makespan"] < region_baseline:
+                        local_no_improve = 0
+                        # if debug:
+                        #     print(
+                        #         f"[TS-N5-REGION] global_it={global_it}, "
+                        #         f"window=({start_idx},{end_idx}), "
+                        #         f"local_iter={local_iter}, "
+                        #         f"machine={chosen['machine']}, "
+                        #         f"swap={chosen['swap']}, "
+                        #         f"region_makespan={region_baseline}->{chosen['region_makespan']}, "
+                        #         f"global_makespan={previous_makespan}->{current_makespan}"
+                        #     )
+                    else:
+                        local_no_improve += 1
 
                 local_iter += 1
                 if local_no_improve >= local_iterations:
@@ -842,8 +1148,8 @@ if __name__ == "__main__":
     st = time()
 
     pdr = PDR(priority=SPT())
-    start_var = 1
-    end_var = 80
+    start_var = 71
+    end_var = 71
     count = 0
     for jsp_dataset in dataset:
         count += 1
@@ -856,14 +1162,14 @@ if __name__ == "__main__":
             f"计算的makespan {ms} 与根据op_start_times计算的makespan不一致 {max(op_start_times[job][jsp_dataset['m']-1] + jsp_dataset['duration'][job][jsp_dataset['m']-1] for job in range(jsp_dataset['j']))}"
         
         print(f"Initial solution for {jsp_dataset['names']} has makespan {ms}, best known makespan {jsp_dataset['makespan']}")
-        best_start_times, best_makespan = tabu_search_n5(
-            jsp_dataset,
+        best_start_times, best_makespan = tabu_search_n5_region(
+            jsp_dataset, 
             op_start_times,
-            max_iterations=1000,
-            tabu_tenure=20,
-            max_no_improve=None,
-            debug=False,
-        )
+            window_size=200, 
+            max_iterations=50, 
+            local_iterations=1000, 
+            tabu_tenure=5,
+            debug=True)
         gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
         better_gap = (best_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
         print(jsp_dataset["names"], f" Gap: {gap:.2f}", f" Better Gap: {better_gap:.2f}")
