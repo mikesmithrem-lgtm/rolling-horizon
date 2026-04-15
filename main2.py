@@ -979,7 +979,12 @@ def convert_solution_to_start_times(sol, jsp_instance):
 
 
 if __name__ == "__main__":
-    dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
+    import os
+    allowed = set(range(1, os.cpu_count()))
+    os.sched_setaffinity(0, allowed)
+    print("CPU affinity:", os.sched_getaffinity(0))
+
+    dataset = JSPNumpyDataset(data_dir="./benchmark/DMU")
     gaps = ObjMeter()
     better_gaps = ObjMeter()
     random.seed(0)
@@ -988,8 +993,13 @@ if __name__ == "__main__":
     from pdrs import solve_instance, PDR, SPT
 
     pdr = PDR(priority=SPT())
-
+    start_var = 1
+    end_var = 80
+    count = 0
     for jsp_dataset in dataset:
+        count += 1
+        if not (count >= start_var and count <= end_var):
+            continue
         # debug
         # # print("调度实例：", jsp_dataset["names"], "Jobs:", jsp_dataset["j"], "Machines:", jsp_dataset["m"])
         # if jsp_dataset["names"].startswith("ta0") or jsp_dataset["names"].startswith("ta1") or jsp_dataset["names"].startswith("ta2") \
@@ -1019,7 +1029,7 @@ if __name__ == "__main__":
                                                                    op_start_times, 
                                                                    use_multi_window=False,
                                                                    window_size=window_size, 
-                                                                   max_iterations=50, 
+                                                                   max_iterations=300, 
                                                                    debug="single_windows",
                                                                    cp_mode=False)
         # print("调度结果开始时间：")

@@ -261,6 +261,7 @@ def convert_solution_to_start_times(sol, jsp_instance):
     schedule_index = [0] * m
 
     while len(scheduled_set) < j * m:
+        progress = False
         for machine in range(m):
             cur_op_index = schedule_index[machine]
             if cur_op_index >= len(sol[machine]):
@@ -281,6 +282,7 @@ def convert_solution_to_start_times(sol, jsp_instance):
 
                     scheduled_set.add((job, op))
                     schedule_index[machine] += 1
+                    progress = True
             else:
                 # 第一个操作，直接安排在机器可用时间之后
                 op_start_times[job][op] = machine_ready[machine]
@@ -289,6 +291,9 @@ def convert_solution_to_start_times(sol, jsp_instance):
 
                 scheduled_set.add((job, op))
                 schedule_index[machine] += 1
+                progress = True
+        if not progress:
+            raise RuntimeError("convert_solution_to_start_times stuck: invalid machine order")
 
     return op_start_times
 
@@ -461,6 +466,7 @@ def split_critical_blocks(crit_path, mch):
         except Exception as e:
             print(f"mch: {mch}, prev: {prev}, cur: {cur}, mch[prev[0]][prev[1]]: {mch[prev[0]][prev[1]]}, mch[cur[0]][cur[1]]: {mch[cur[0]][cur[1]]}")
             print("Error in split_critical_blocks:", e)
+            raise e
 
     if len(current_block) >= 2:
         blocks.append(current_block)
@@ -631,7 +637,12 @@ def tabu_search_n5(
 
 
 if __name__ == "__main__":
-    dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
+    import os
+    allowed = set(range(1, os.cpu_count()))
+    os.sched_setaffinity(0, allowed)
+    print("CPU affinity:", os.sched_getaffinity(0))
+
+    dataset = JSPNumpyDataset(data_dir="./benchmark/DMU")
     gaps = ObjMeter()
     better_gaps = ObjMeter()
     random.seed(0)
@@ -655,7 +666,7 @@ if __name__ == "__main__":
         best_start_times, best_makespan = tabu_search_n5(
             jsp_dataset,
             op_start_times,
-            max_iterations=1000,
+            max_iterations=5000,
             tabu_tenure=20,
             max_no_improve=None,
             debug=False,
