@@ -61,7 +61,6 @@ def priority_dispatch_rule(jsp_instance, rule="spt"):
     makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
     return op_start_times, makespan
 
-
 def solve_window_with_machine_avail(jsp_instance, 
                                     ops_in_window, 
                                     op_start_times, 

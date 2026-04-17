@@ -2,6 +2,7 @@ import os
 import random
 from collections import defaultdict
 from time import time
+import matplotlib.pyplot as plt
 
 
 class JSPNumpyDataset:
@@ -1139,7 +1140,55 @@ def tabu_search_n5_region(
     return best_start, best_makespan
 
 
+def plot_gantt(op_start_times, jsp_instance, title="Job Shop Gantt"):
+    j, m = jsp_instance["j"], jsp_instance["m"]
+    duration = jsp_instance["duration"]
+    mch = jsp_instance["mch"]
+
+    # 机器为行，任务操作为横条
+    fig, ax = plt.subplots(figsize=(12, 6))
+    colors = plt.get_cmap("tab20").colors
+
+    for job in range(j):
+        for op in range(m):
+            start = op_start_times[job][op]
+            dur = duration[job][op]
+            machine = mch[job][op]
+            color = colors[job % len(colors)]
+            ax.barh(
+                machine,
+                dur,
+                left=start,
+                height=0.8,
+                color=color,
+                edgecolor="black",
+                alpha=0.8,
+            )
+            ax.text(
+                start + dur / 2,
+                machine,
+                f"J{job}O{op}",
+                va="center",
+                ha="center",
+                fontsize=8,
+                color="white",
+            )
+
+    ax.set_ylabel("Machine")
+    ax.set_xlabel("Time")
+    ax.set_yticks(range(max(max(row) for row in mch) + 1))
+    ax.set_yticklabels([f"M{i}" for i in range(max(max(row) for row in mch) + 1)])
+    ax.set_title(title)
+    ax.grid(True, axis="x", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(f"{title}.png")
+
+
 if __name__ == "__main__":
+    import os
+    allowed = set(range(1, os.cpu_count()))
+    os.sched_setaffinity(0, allowed)
+    print("CPU affinity:", os.sched_getaffinity(0))
 
     dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
     gaps = ObjMeter()
@@ -1148,8 +1197,8 @@ if __name__ == "__main__":
     st = time()
 
     pdr = PDR(priority=SPT())
-    start_var = 71
-    end_var = 71
+    start_var = 1
+    end_var = 30
     count = 0
     for jsp_dataset in dataset:
         count += 1
@@ -1167,9 +1216,9 @@ if __name__ == "__main__":
             op_start_times,
             window_size=200, 
             max_iterations=50, 
-            local_iterations=1000, 
-            tabu_tenure=5,
-            debug=True)
+            local_iterations=500, 
+            tabu_tenure=20,
+            debug=False)
         gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
         better_gap = (best_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
         print(jsp_dataset["names"], f" Gap: {gap:.2f}", f" Better Gap: {better_gap:.2f}")
