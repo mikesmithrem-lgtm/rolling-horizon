@@ -1,5 +1,5 @@
 import numpy as np
-from L2S.parameters import args
+from parameters import args
 
 
 def permissibleLeftShift(a, durMat, mchMat, mchsStartTimes, opIDsOnMchs):

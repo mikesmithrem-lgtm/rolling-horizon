@@ -1,6 +1,9 @@
+import os
 import numpy as np
 from ortools.sat.python import cp_model
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from PIL import Image
 from dataset import JSPNumpyDataset, ObjMeter
 import random
 import multiprocessing
@@ -60,7 +63,6 @@ def priority_dispatch_rule(jsp_instance, rule="spt"):
 
     makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
     return op_start_times, makespan
-
 
 def solve_window_with_machine_avail(jsp_instance, 
                                     ops_in_window, 
@@ -290,7 +292,9 @@ def large_neiborhood_search(
     window_size=10,
     max_iterations=100, 
     debug="all_windows", 
-    cp_mode=False):
+    cp_mode=False,
+    plot_improvements=False,
+    plot_dir="gantt_improvements"):
 
     j, m = jsp_instance["j"], jsp_instance["m"]
     nopr = j * m
@@ -303,6 +307,11 @@ def large_neiborhood_search(
 
     best_solution = [row[:] for row in est]
     best_makespan = max(est[job][m-1] + duration[job][m-1] for job in range(j))
+    improvement_count = 0
+    process_frame_paths = []
+    instance_name = os.path.splitext(
+        os.path.basename(jsp_instance.get("names", "instance"))
+    )[0]
     if nopr <= window_size:
         return best_solution, best_makespan
     
@@ -411,9 +420,13 @@ def large_neiborhood_search(
             #     else:
             #         window_idx = next_window_idx
             #         roll_count += 1
-        
+
 
         ops_in_window = sorted_ops[window_idx:window_idx + window_size]
+        focus_window_before = sorted(
+            ops_in_window,
+            key=lambda item: op_start_times[item[0]][item[1]],
+        )
         if cp_mode:
             assert max_iterations == 1, f"CP mode must make iteration as 1"
             assert debug == 'single_windows', f"CP mode debug must be single window"
@@ -908,8 +921,67 @@ def large_neiborhood_search(
         #print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
         if makespan < best_makespan:
             count += 1
+            previous_solution = [row[:] for row in best_solution]
+            previous_makespan = best_makespan
+            focus_window_after = sorted(
+                focus_window_before,
+                key=lambda item: op_start_times[item[0]][item[1]],
+            )
+            changed_ops = _collect_reordered_ops(
+                focus_window_before,
+                focus_window_after,
+            )
             best_solution = [row[:] for row in op_start_times]
             best_makespan = makespan
+            improvement_count += 1
+            if plot_improvements:
+                file_stem = (
+                    f"{instance_name}_improve_{improvement_count:03d}_"
+                    f"it_{it:03d}_ms_{best_makespan}"
+                )
+                before_path = os.path.join(plot_dir, f"{file_stem}_before.png")
+                after_path = os.path.join(plot_dir, f"{file_stem}_after.png")
+                window_change_info = {
+                    "before_order": focus_window_before,
+                    "after_order": focus_window_after,
+                    "changed_ops": changed_ops,
+                }
+                plot_gantt(
+                    previous_solution,
+                    jsp_instance,
+                    title=(
+                        f"{instance_name} | improve #{improvement_count} | "
+                        f"before reorder | makespan={previous_makespan}"
+                    ),
+                    highlight_region=_build_window_highlight(
+                        previous_solution,
+                        jsp_instance,
+                        focus_window_before,
+                    ),
+                    window_change_info=window_change_info,
+                    save_path=before_path,
+                )
+                plot_gantt(
+                    best_solution,
+                    jsp_instance,
+                    title=(
+                        f"{instance_name} | improve #{improvement_count} | "
+                        f"after reorder | makespan={best_makespan}"
+                    ),
+                    highlight_region=_build_window_highlight(
+                        best_solution,
+                        jsp_instance,
+                        focus_window_after,
+                    ),
+                    window_change_info=window_change_info,
+                    save_path=after_path,
+                )
+                save_gantt_transition_gif(
+                    before_path,
+                    after_path,
+                    os.path.join(plot_dir, f"{file_stem}.gif"),
+                )
+                process_frame_paths.extend([before_path, after_path])
             # DEBUG: 仅在特定实例上打印改进信息
             # print(f"Iteration {it}: Found better solution with makespan {best_makespan}")
             if debug == 'all_windows':
@@ -924,6 +996,12 @@ def large_neiborhood_search(
             # break
         else:
             find_better_in_this_iteration = False
+
+    if plot_improvements and process_frame_paths:
+        save_gantt_search_process_gif(
+            process_frame_paths,
+            os.path.join(plot_dir, f"{instance_name}_search_process.gif"),
+        )
 
     print(f"LNS finished after {max_iterations} iterations, improved {count} times, best makespan: {best_makespan}")
     return best_solution, best_makespan
@@ -978,13 +1056,327 @@ def convert_solution_to_start_times(sol, jsp_instance):
     return op_start_times
 
 
+def _format_op_label(op):
+    return f"J{op[0]}O{op[1]}"
+
+
+def _collect_reordered_ops(before_order, after_order):
+    changed_ops = set()
+    max_len = max(len(before_order), len(after_order))
+    for idx in range(max_len):
+        before_op = before_order[idx] if idx < len(before_order) else None
+        after_op = after_order[idx] if idx < len(after_order) else None
+        if before_op != after_op:
+            if before_op is not None:
+                changed_ops.add(before_op)
+            if after_op is not None:
+                changed_ops.add(after_op)
+    return changed_ops
+
+
+def _build_window_highlight(op_start_times, jsp_instance, ops_in_window):
+    if not ops_in_window:
+        return None
+
+    duration = jsp_instance["duration"]
+    mch = jsp_instance["mch"]
+    machine_orders = defaultdict(list)
+    for job, op in ops_in_window:
+        machine_orders[mch[job][op]].append((job, op))
+
+    sorted_machine_orders = {
+        machine: sorted(
+            order,
+            key=lambda item: op_start_times[item[0]][item[1]],
+        )
+        for machine, order in machine_orders.items()
+    }
+    if not sorted_machine_orders:
+        return None
+
+    return {"machine_orders": sorted_machine_orders}
+
+
+def _draw_window_sequence_panel(info_ax, before_order, after_order, changed_ops):
+    def draw_sequence(title, ops, top, bottom):
+        info_ax.text(
+            0.02,
+            top,
+            title,
+            transform=info_ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=11,
+            fontweight="bold",
+        )
+        if not ops:
+            info_ax.text(
+                0.02,
+                top - 0.06,
+                "(empty)",
+                transform=info_ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                color="gray",
+            )
+            return
+
+        body_top = top - 0.06
+        body_bottom = bottom + 0.02
+        target_rows = 10
+        tokens_per_row = max(4, int(np.ceil(len(ops) / target_rows)))
+        rows = int(np.ceil(len(ops) / tokens_per_row))
+        row_step = (body_top - body_bottom) / max(rows - 1, 1)
+        col_step = 0.96 / max(tokens_per_row, 1)
+        font_size = max(5.5, 9 - max(0, rows - 8) * 0.35)
+
+        for idx, op in enumerate(ops):
+            row = idx // tokens_per_row
+            col = idx % tokens_per_row
+            x = 0.02 + col * col_step
+            y = body_top - row * row_step
+            is_changed = op in changed_ops
+            info_ax.text(
+                x,
+                y,
+                _format_op_label(op),
+                transform=info_ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=font_size,
+                fontweight="bold" if is_changed else "normal",
+                color="darkred" if is_changed else "black",
+                family="monospace",
+            )
+
+    info_ax.set_axis_off()
+    info_ax.text(
+        0.02,
+        0.99,
+        "Window reorder",
+        transform=info_ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+    )
+    info_ax.text(
+        0.02,
+        0.95,
+        "Changed operations are highlighted in bold.",
+        transform=info_ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="dimgray",
+    )
+    draw_sequence("Before order", before_order, 0.90, 0.53)
+    info_ax.plot(
+        [0.02, 0.98],
+        [0.50, 0.50],
+        transform=info_ax.transAxes,
+        color="lightgray",
+        linewidth=1.0,
+    )
+    draw_sequence("After order", after_order, 0.47, 0.05)
+
+
+def plot_gantt(
+    op_start_times,
+    jsp_instance,
+    title="Job Shop Gantt",
+    highlight_region=None,
+    window_change_info=None,
+    save_path=None,
+):
+    j, m = jsp_instance["j"], jsp_instance["m"]
+    duration = jsp_instance["duration"]
+    mch = jsp_instance["mch"]
+    max_completion = max(
+        op_start_times[job][op] + duration[job][op]
+        for job in range(j)
+        for op in range(m)
+    )
+    label_inside_threshold = max(2.0, max_completion * 0.035)
+    changed_ops = set()
+    if window_change_info is not None:
+        changed_ops = window_change_info.get("changed_ops")
+        if changed_ops is None:
+            changed_ops = _collect_reordered_ops(
+                window_change_info.get("before_order", []),
+                window_change_info.get("after_order", []),
+            )
+
+    fig, (ax, info_ax) = plt.subplots(
+        1,
+        2,
+        figsize=(18, 7),
+        gridspec_kw={"width_ratios": [3.7, 2.3]},
+    )
+    colors = plt.get_cmap("tab20").colors
+
+    if highlight_region is not None:
+        for machine, region_order in sorted(highlight_region.get("machine_orders", {}).items()):
+            if not region_order:
+                continue
+
+            starts = [op_start_times[job][op] for job, op in region_order]
+            finishes = [
+                op_start_times[job][op] + duration[job][op]
+                for job, op in region_order
+            ]
+            region_start = min(starts)
+            region_end = max(finishes)
+            ax.add_patch(
+                Rectangle(
+                    (region_start, machine - 0.48),
+                    region_end - region_start,
+                    0.96,
+                    facecolor="gold",
+                    edgecolor="none",
+                    alpha=0.18,
+                    zorder=0.5,
+                )
+            )
+
+    for job in range(j):
+        for op in range(m):
+            start = op_start_times[job][op]
+            dur = duration[job][op]
+            machine = mch[job][op]
+            color = colors[job % len(colors)]
+            is_changed_op = (job, op) in changed_ops
+            ax.barh(
+                machine,
+                dur,
+                left=start,
+                height=0.8,
+                color=color,
+                edgecolor="darkred" if is_changed_op else "black",
+                linewidth=2.5 if is_changed_op else 1.0,
+                alpha=1.0 if is_changed_op else 0.8,
+                hatch="//" if is_changed_op else None,
+                zorder=3 if is_changed_op else 2,
+            )
+            label = _format_op_label((job, op))
+            if dur >= label_inside_threshold:
+                ax.text(
+                    start + dur / 2,
+                    machine,
+                    label,
+                    va="center",
+                    ha="center",
+                    fontsize=9 if is_changed_op else 8,
+                    fontweight="bold" if is_changed_op else "normal",
+                    color="white",
+                    zorder=4,
+                )
+            else:
+                offset_y = 0.22 if (job + op) % 2 == 0 else -0.22
+                ax.text(
+                    start + dur + max_completion * 0.005,
+                    machine + offset_y,
+                    label,
+                    va="center",
+                    ha="left",
+                    fontsize=8,
+                    fontweight="bold" if is_changed_op else "normal",
+                    color="darkred" if is_changed_op else "black",
+                    bbox={
+                        "boxstyle": "round,pad=0.15",
+                        "facecolor": "white",
+                        "edgecolor": "darkred" if is_changed_op else "none",
+                        "alpha": 0.85,
+                    },
+                    zorder=5,
+                    clip_on=False,
+                )
+
+    if window_change_info is not None:
+        _draw_window_sequence_panel(
+            info_ax,
+            window_change_info.get("before_order", []),
+            window_change_info.get("after_order", []),
+            changed_ops,
+        )
+    else:
+        info_ax.set_axis_off()
+
+    ax.set_ylabel("Machine")
+    ax.set_xlabel("Time")
+    ax.set_xlim(0, max_completion + max(1.0, max_completion * 0.08))
+    ax.set_yticks(range(max(max(row) for row in mch) + 1))
+    ax.set_yticklabels([f"M{i}" for i in range(max(max(row) for row in mch) + 1)])
+    ax.set_title(title)
+    ax.grid(True, axis="x", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+
+    if save_path is None:
+        safe_title = "".join(
+            ch if ch.isalnum() or ch in "._-()[]{}=+" else "_"
+            for ch in title
+        )
+        save_path = f"{safe_title}.png"
+
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+def save_gantt_transition_gif(before_path, after_path, gif_path, frame_duration=900):
+    gif_dir = os.path.dirname(gif_path)
+    if gif_dir:
+        os.makedirs(gif_dir, exist_ok=True)
+
+    with Image.open(before_path) as before_img, Image.open(after_path) as after_img:
+        before_frame = before_img.convert("P", palette=Image.ADAPTIVE)
+        after_frame = after_img.convert("P", palette=Image.ADAPTIVE)
+        before_frame.save(
+            gif_path,
+            save_all=True,
+            append_images=[after_frame],
+            duration=[frame_duration, frame_duration],
+            loop=0,
+        )
+
+
+def save_gantt_search_process_gif(frame_paths, gif_path, frame_duration=700):
+    if not frame_paths:
+        return
+
+    gif_dir = os.path.dirname(gif_path)
+    if gif_dir:
+        os.makedirs(gif_dir, exist_ok=True)
+
+    frames = []
+    for frame_path in frame_paths:
+        with Image.open(frame_path) as frame_img:
+            frames.append(frame_img.convert("P", palette=Image.ADAPTIVE))
+
+    if not frames:
+        return
+
+    first_frame, *rest_frames = frames
+    first_frame.save(
+        gif_path,
+        save_all=True,
+        append_images=rest_frames,
+        duration=[frame_duration] * len(frames),
+        loop=0,
+    )
+
+
 if __name__ == "__main__":
     import os
     allowed = set(range(1, os.cpu_count()))
     os.sched_setaffinity(0, allowed)
     print("CPU affinity:", os.sched_getaffinity(0))
 
-    dataset = JSPNumpyDataset(data_dir="./benchmark/DMU")
+    dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
     gaps = ObjMeter()
     better_gaps = ObjMeter()
     random.seed(0)
@@ -993,8 +1385,8 @@ if __name__ == "__main__":
     from pdrs import solve_instance, PDR, SPT
 
     pdr = PDR(priority=SPT())
-    start_var = 1
-    end_var = 80
+    start_var = 21
+    end_var = 21
     count = 0
     for jsp_dataset in dataset:
         count += 1
@@ -1029,9 +1421,11 @@ if __name__ == "__main__":
                                                                    op_start_times, 
                                                                    use_multi_window=False,
                                                                    window_size=window_size, 
-                                                                   max_iterations=300, 
+                                                                   max_iterations=1000, 
                                                                    debug="single_windows",
-                                                                   cp_mode=False)
+                                                                   cp_mode=False,
+                                                                   plot_improvements=True,
+                                                                   plot_dir=f"gantt_improvements_cp_ta{start_var}")
         # print("调度结果开始时间：")
         # for job, starts in enumerate(op_start_times):
         #     print(f"Job {job}: {starts}")
