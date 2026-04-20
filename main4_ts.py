@@ -2,6 +2,8 @@ import os
 import random
 from collections import defaultdict
 from time import time
+import matplotlib.pyplot as plt
+from PIL import Image
 
 
 class JSPNumpyDataset:
@@ -545,6 +547,8 @@ def tabu_search_n5(
     tabu_tenure=None,
     max_no_improve=None,
     debug=False,
+    plot_improvements=False,
+    plot_dir="gantt_improvements",
 ):
     """
     使用经典禁忌搜索 + N5 邻域求解 JSSP。
@@ -573,6 +577,11 @@ def tabu_search_n5(
     )
     best_start = [row[:] for row in current_start]
     best_makespan = current_makespan
+    improvement_count = 0
+    process_frame_paths = []
+    instance_name = os.path.splitext(
+        os.path.basename(jsp_instance.get("names", "instance"))
+    )[0]
 
     if tabu_tenure is None:
         tabu_tenure = max(5, min(10, total_ops // 10 + 1))
@@ -612,6 +621,8 @@ def tabu_search_n5(
         if chosen is None:
             break
 
+        previous_start = [row[:] for row in current_start]
+        previous_makespan = current_makespan
         current_start = [row[:] for row in chosen["start_times"]]
         current_makespan = chosen["makespan"]
         tabu_until[chosen["tabu_key"]] = iteration + tabu_tenure
@@ -619,7 +630,45 @@ def tabu_search_n5(
         if current_makespan < best_makespan:
             best_start = [row[:] for row in current_start]
             best_makespan = current_makespan
+            improvement_count += 1
             no_improve_rounds = 0
+            if plot_improvements:
+                file_stem = (
+                    f"{instance_name}_improve_{improvement_count:03d}_"
+                    f"it_{iteration:03d}_ms_{best_makespan}"
+                )
+                before_path = os.path.join(plot_dir, f"{file_stem}_before.png")
+                after_path = os.path.join(plot_dir, f"{file_stem}_after.png")
+                swap_info = {
+                    "machine": chosen["machine"],
+                    "swap": chosen["swap"],
+                }
+                plot_gantt(
+                    previous_start,
+                    jsp_instance,
+                    title=(
+                        f"{instance_name} | improve #{improvement_count} | "
+                        f"before swap | makespan={previous_makespan}"
+                    ),
+                    swap_info=swap_info,
+                    save_path=before_path,
+                )
+                plot_gantt(
+                    current_start,
+                    jsp_instance,
+                    title=(
+                        f"{instance_name} | improve #{improvement_count} | "
+                        f"after swap | makespan={best_makespan}"
+                    ),
+                    swap_info=swap_info,
+                    save_path=after_path,
+                )
+                save_gantt_transition_gif(
+                    before_path,
+                    after_path,
+                    os.path.join(plot_dir, f"{file_stem}.gif"),
+                )
+                process_frame_paths.extend([before_path, after_path])
             if debug:
                 print(
                     f"[TS-N5] iter={iteration}, "
@@ -633,7 +682,180 @@ def tabu_search_n5(
         if no_improve_rounds >= max_no_improve:
             break
 
+    if plot_improvements and process_frame_paths:
+        save_gantt_search_process_gif(
+            process_frame_paths,
+            os.path.join(plot_dir, f"{instance_name}_search_process.gif"),
+        )
+
     return best_start, best_makespan
+
+
+def plot_gantt(
+    op_start_times,
+    jsp_instance,
+    title="Job Shop Gantt",
+    swap_info=None,
+    save_path=None,
+):
+    j, m = jsp_instance["j"], jsp_instance["m"]
+    duration = jsp_instance["duration"]
+    mch = jsp_instance["mch"]
+    max_completion = max(
+        op_start_times[job][op] + duration[job][op]
+        for job in range(j)
+        for op in range(m)
+    )
+    label_inside_threshold = max(2.0, max_completion * 0.035)
+    swap_ops = set()
+    if swap_info is not None:
+        swap_ops = set(swap_info["swap"])
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    colors = plt.get_cmap("tab20").colors
+
+    for job in range(j):
+        for op in range(m):
+            start = op_start_times[job][op]
+            dur = duration[job][op]
+            machine = mch[job][op]
+            color = colors[job % len(colors)]
+            is_swap_op = (job, op) in swap_ops
+            ax.barh(
+                machine,
+                dur,
+                left=start,
+                height=0.8,
+                color=color,
+                edgecolor="darkred" if is_swap_op else "black",
+                linewidth=2.5 if is_swap_op else 1.0,
+                alpha=1.0 if is_swap_op else 0.8,
+                hatch="//" if is_swap_op else None,
+                zorder=3 if is_swap_op else 2,
+            )
+            label = f"J{job}O{op}"
+            if dur >= label_inside_threshold:
+                ax.text(
+                    start + dur / 2,
+                    machine,
+                    label,
+                    va="center",
+                    ha="center",
+                    fontsize=9 if is_swap_op else 8,
+                    fontweight="bold" if is_swap_op else "normal",
+                    color="white",
+                    zorder=4,
+                )
+            else:
+                offset_y = 0.22 if (job + op) % 2 == 0 else -0.22
+                ax.text(
+                    start + dur + max_completion * 0.005,
+                    machine + offset_y,
+                    label,
+                    va="center",
+                    ha="left",
+                    fontsize=8,
+                    fontweight="bold" if is_swap_op else "normal",
+                    color="darkred" if is_swap_op else "black",
+                    bbox={
+                        "boxstyle": "round,pad=0.15",
+                        "facecolor": "white",
+                        "edgecolor": "darkred" if is_swap_op else "none",
+                        "alpha": 0.85,
+                    },
+                    zorder=5,
+                    clip_on=False,
+                )
+
+    if swap_info is not None:
+        machine = swap_info.get("machine")
+        first, second = swap_info["swap"]
+        swap_text = (
+            f"Swap on M{machine}: "
+            f"J{first[0]}O{first[1]} <-> J{second[0]}O{second[1]}"
+        )
+        ax.text(
+            0.01,
+            0.99,
+            swap_text,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            bbox={
+                "boxstyle": "round,pad=0.3",
+                "facecolor": "white",
+                "edgecolor": "darkred",
+                "alpha": 0.9,
+            },
+            zorder=20,
+        )
+
+    ax.set_ylabel("Machine")
+    ax.set_xlabel("Time")
+    ax.set_xlim(0, max_completion + max(1.0, max_completion * 0.08))
+    ax.set_yticks(range(max(max(row) for row in mch) + 1))
+    ax.set_yticklabels([f"M{i}" for i in range(max(max(row) for row in mch) + 1)])
+    ax.set_title(title)
+    ax.grid(True, axis="x", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+
+    if save_path is None:
+        safe_title = "".join(
+            ch if ch.isalnum() or ch in "._-()[]{}=+" else "_"
+            for ch in title
+        )
+        save_path = f"{safe_title}.png"
+
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+def save_gantt_transition_gif(before_path, after_path, gif_path, frame_duration=900):
+    gif_dir = os.path.dirname(gif_path)
+    if gif_dir:
+        os.makedirs(gif_dir, exist_ok=True)
+
+    with Image.open(before_path) as before_img, Image.open(after_path) as after_img:
+        before_frame = before_img.convert("P", palette=Image.ADAPTIVE)
+        after_frame = after_img.convert("P", palette=Image.ADAPTIVE)
+        before_frame.save(
+            gif_path,
+            save_all=True,
+            append_images=[after_frame],
+            duration=[frame_duration, frame_duration],
+            loop=0,
+        )
+
+
+def save_gantt_search_process_gif(frame_paths, gif_path, frame_duration=700):
+    if not frame_paths:
+        return
+
+    gif_dir = os.path.dirname(gif_path)
+    if gif_dir:
+        os.makedirs(gif_dir, exist_ok=True)
+
+    frames = []
+    for frame_path in frame_paths:
+        with Image.open(frame_path) as frame_img:
+            frames.append(frame_img.convert("P", palette=Image.ADAPTIVE))
+
+    if not frames:
+        return
+
+    first_frame, *rest_frames = frames
+    first_frame.save(
+        gif_path,
+        save_all=True,
+        append_images=rest_frames,
+        duration=[frame_duration] * len(frames),
+        loop=0,
+    )
 
 
 if __name__ == "__main__":
@@ -642,15 +864,15 @@ if __name__ == "__main__":
     os.sched_setaffinity(0, allowed)
     print("CPU affinity:", os.sched_getaffinity(0))
 
-    dataset = JSPNumpyDataset(data_dir="./benchmark/DMU")
+    dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
     gaps = ObjMeter()
     better_gaps = ObjMeter()
     random.seed(0)
     st = time()
 
     pdr = PDR(priority=SPT())
-    start_var = 1
-    end_var = 80
+    start_var = 21
+    end_var = 21
     count = 0
     for jsp_dataset in dataset:
         count += 1
@@ -666,10 +888,12 @@ if __name__ == "__main__":
         best_start_times, best_makespan = tabu_search_n5(
             jsp_dataset,
             op_start_times,
-            max_iterations=5000,
+            max_iterations=10000,
             tabu_tenure=20,
             max_no_improve=None,
             debug=False,
+            plot_improvements=False,
+            plot_dir="gantt_improvements_tsonly",
         )
         gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
         better_gap = (best_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100

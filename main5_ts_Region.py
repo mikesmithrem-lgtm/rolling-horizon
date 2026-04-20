@@ -3,6 +3,8 @@ import random
 from collections import defaultdict
 from time import time
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from PIL import Image
 
 
 class JSPNumpyDataset:
@@ -928,6 +930,8 @@ def tabu_search_n5_region(
     tabu_tenure=None,
     max_no_improve=None,
     debug=False,
+    plot_improvements=False,
+    plot_dir="gantt_improvements",
 ):
     """
     基于时间窗口（按开始时间排序的操作序列划分窗口） 的区域化 N5 禁忌搜索。
@@ -965,6 +969,11 @@ def tabu_search_n5_region(
     current_makespan = max(current_start[job][m - 1] + duration[job][m - 1] for job in range(j))
     best_start = [row[:] for row in current_start]
     best_makespan = current_makespan
+    improvement_count = 0
+    process_frame_paths = []
+    instance_name = os.path.splitext(
+        os.path.basename(jsp_instance.get("names", "instance"))
+    )[0]
 
     # 全局 tabu map 保留跨窗口禁忌（可选）
     tabu_until = {}
@@ -982,7 +991,8 @@ def tabu_search_n5_region(
         #     (start_idx, min(start_idx + window_size, nopr))
         #     for start_idx in range(0, nopr, window_size)
         # ]
-        start_idx = random.randint(0, nopr - window_size)
+        # start_idx = random.randint(0, nopr - window_size)
+        start_idx = random.randint(0, nopr)
         windows = [
             (start_idx, min(start_idx + window_size, nopr))
         ]
@@ -1081,6 +1091,7 @@ def tabu_search_n5_region(
                 if chosen is None:
                     break
 
+                previous_start = [row[:] for row in current_start]
                 previous_makespan = current_makespan
                 current_start = [row[:] for row in chosen["start_times"]]
                 current_makespan = chosen["makespan"]
@@ -1090,8 +1101,55 @@ def tabu_search_n5_region(
                 if current_makespan < best_makespan:
                     best_start = [row[:] for row in current_start]
                     best_makespan = current_makespan
+                    improvement_count += 1
                     local_no_improve = 0
                     improved_in_cycle = True
+                    if plot_improvements:
+                        file_stem = (
+                            f"{instance_name}_improve_{improvement_count:03d}_"
+                            f"g{global_it:03d}_l{local_iter:03d}_ms_{best_makespan}"
+                        )
+                        swap_info = {
+                            "machine": chosen["machine"],
+                            "swap": chosen["swap"],
+                        }
+                        after_region_info = _build_region_subproblem(
+                            jsp_instance,
+                            current_start,
+                            list(chosen["swap"]),
+                        )
+                        if after_region_info is None:
+                            after_region_info = region_info
+                        before_path = os.path.join(plot_dir, f"{file_stem}_before.png")
+                        after_path = os.path.join(plot_dir, f"{file_stem}_after.png")
+                        plot_gantt(
+                            previous_start,
+                            jsp_instance,
+                            title=(
+                                f"{instance_name} | improve #{improvement_count} | "
+                                f"before swap | makespan={previous_makespan}"
+                            ),
+                            highlight_region=region_info,
+                            swap_info=swap_info,
+                            save_path=before_path,
+                        )
+                        plot_gantt(
+                            current_start,
+                            jsp_instance,
+                            title=(
+                                f"{instance_name} | improve #{improvement_count} | "
+                                f"after swap | makespan={best_makespan}"
+                            ),
+                            highlight_region=after_region_info,
+                            swap_info=swap_info,
+                            save_path=after_path,
+                        )
+                        save_gantt_transition_gif(
+                            before_path,
+                            after_path,
+                            os.path.join(plot_dir, f"{file_stem}.gif"),
+                        )
+                        process_frame_paths.extend([before_path, after_path])
                     if debug:
                         print(
                             f"[TS-N5-REGION] global_it={global_it}, "
@@ -1137,17 +1195,63 @@ def tabu_search_n5_region(
         if no_improve_rounds >= max_no_improve:
             break
 
+    if plot_improvements and process_frame_paths:
+        save_gantt_search_process_gif(
+            process_frame_paths,
+            os.path.join(plot_dir, f"{instance_name}_search_process.gif"),
+        )
+
     return best_start, best_makespan
 
 
-def plot_gantt(op_start_times, jsp_instance, title="Job Shop Gantt"):
+def plot_gantt(
+    op_start_times,
+    jsp_instance,
+    title="Job Shop Gantt",
+    highlight_region=None,
+    swap_info=None,
+    save_path=None,
+):
     j, m = jsp_instance["j"], jsp_instance["m"]
     duration = jsp_instance["duration"]
     mch = jsp_instance["mch"]
+    max_completion = max(
+        op_start_times[job][op] + duration[job][op]
+        for job in range(j)
+        for op in range(m)
+    )
+    label_inside_threshold = max(2.0, max_completion * 0.035)
+    swap_ops = set()
+    if swap_info is not None:
+        swap_ops = set(swap_info["swap"])
 
     # 机器为行，任务操作为横条
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 7))
     colors = plt.get_cmap("tab20").colors
+
+    if highlight_region is not None:
+        for machine, region_order in sorted(highlight_region.get("machine_orders", {}).items()):
+            if not region_order:
+                continue
+
+            starts = [op_start_times[job][op] for job, op in region_order]
+            finishes = [
+                op_start_times[job][op] + duration[job][op]
+                for job, op in region_order
+            ]
+            region_start = min(starts)
+            region_end = max(finishes)
+            ax.add_patch(
+                Rectangle(
+                    (region_start, machine - 0.48),
+                    region_end - region_start,
+                    0.96,
+                    facecolor="gold",
+                    edgecolor="none",
+                    alpha=0.18,
+                    zorder=0.5,
+                )
+            )
 
     for job in range(j):
         for op in range(m):
@@ -1155,33 +1259,141 @@ def plot_gantt(op_start_times, jsp_instance, title="Job Shop Gantt"):
             dur = duration[job][op]
             machine = mch[job][op]
             color = colors[job % len(colors)]
+            is_swap_op = (job, op) in swap_ops
             ax.barh(
                 machine,
                 dur,
                 left=start,
                 height=0.8,
                 color=color,
-                edgecolor="black",
-                alpha=0.8,
+                edgecolor="darkred" if is_swap_op else "black",
+                linewidth=2.5 if is_swap_op else 1.0,
+                alpha=1.0 if is_swap_op else 0.8,
+                hatch="//" if is_swap_op else None,
+                zorder=3 if is_swap_op else 2,
             )
-            ax.text(
-                start + dur / 2,
-                machine,
-                f"J{job}O{op}",
-                va="center",
-                ha="center",
-                fontsize=8,
-                color="white",
-            )
+            label = f"J{job}O{op}"
+            if dur >= label_inside_threshold:
+                ax.text(
+                    start + dur / 2,
+                    machine,
+                    label,
+                    va="center",
+                    ha="center",
+                    fontsize=9 if is_swap_op else 8,
+                    fontweight="bold" if is_swap_op else "normal",
+                    color="white",
+                    zorder=4,
+                )
+            else:
+                offset_y = 0.22 if (job + op) % 2 == 0 else -0.22
+                ax.text(
+                    start + dur + max_completion * 0.005,
+                    machine + offset_y,
+                    label,
+                    va="center",
+                    ha="left",
+                    fontsize=8,
+                    fontweight="bold" if is_swap_op else "normal",
+                    color="darkred" if is_swap_op else "black",
+                    bbox={
+                        "boxstyle": "round,pad=0.15",
+                        "facecolor": "white",
+                        "edgecolor": "darkred" if is_swap_op else "none",
+                        "alpha": 0.85,
+                    },
+                    zorder=5,
+                    clip_on=False,
+                )
+
+    if swap_info is not None:
+        machine = swap_info.get("machine")
+        first, second = swap_info["swap"]
+        swap_text = (
+            f"Swap on M{machine}: "
+            f"J{first[0]}O{first[1]} <-> J{second[0]}O{second[1]}"
+        )
+        ax.text(
+            0.01,
+            0.99,
+            swap_text,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            bbox={
+                "boxstyle": "round,pad=0.3",
+                "facecolor": "white",
+                "edgecolor": "darkred",
+                "alpha": 0.9,
+            },
+            zorder=20,
+        )
 
     ax.set_ylabel("Machine")
     ax.set_xlabel("Time")
+    ax.set_xlim(0, max_completion + max(1.0, max_completion * 0.08))
     ax.set_yticks(range(max(max(row) for row in mch) + 1))
     ax.set_yticklabels([f"M{i}" for i in range(max(max(row) for row in mch) + 1)])
     ax.set_title(title)
     ax.grid(True, axis="x", linestyle="--", alpha=0.4)
     plt.tight_layout()
-    plt.savefig(f"{title}.png")
+    if save_path is None:
+        safe_title = "".join(
+            ch if ch.isalnum() or ch in "._-()[]{}=+" else "_"
+            for ch in title
+        )
+        save_path = f"{safe_title}.png"
+
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+def save_gantt_transition_gif(before_path, after_path, gif_path, frame_duration=900):
+    gif_dir = os.path.dirname(gif_path)
+    if gif_dir:
+        os.makedirs(gif_dir, exist_ok=True)
+
+    with Image.open(before_path) as before_img, Image.open(after_path) as after_img:
+        before_frame = before_img.convert("P", palette=Image.ADAPTIVE)
+        after_frame = after_img.convert("P", palette=Image.ADAPTIVE)
+        before_frame.save(
+            gif_path,
+            save_all=True,
+            append_images=[after_frame],
+            duration=[frame_duration, frame_duration],
+            loop=0,
+        )
+
+
+def save_gantt_search_process_gif(frame_paths, gif_path, frame_duration=700):
+    if not frame_paths:
+        return
+
+    gif_dir = os.path.dirname(gif_path)
+    if gif_dir:
+        os.makedirs(gif_dir, exist_ok=True)
+
+    frames = []
+    for frame_path in frame_paths:
+        with Image.open(frame_path) as frame_img:
+            frames.append(frame_img.convert("P", palette=Image.ADAPTIVE))
+
+    if not frames:
+        return
+
+    first_frame, *rest_frames = frames
+    first_frame.save(
+        gif_path,
+        save_all=True,
+        append_images=rest_frames,
+        duration=[frame_duration] * len(frames),
+        loop=0,
+    )
 
 
 if __name__ == "__main__":
@@ -1197,8 +1409,8 @@ if __name__ == "__main__":
     st = time()
 
     pdr = PDR(priority=SPT())
-    start_var = 1
-    end_var = 30
+    start_var = 21
+    end_var = 21
     count = 0
     for jsp_dataset in dataset:
         count += 1
@@ -1218,7 +1430,9 @@ if __name__ == "__main__":
             max_iterations=50, 
             local_iterations=500, 
             tabu_tenure=20,
-            debug=False)
+            debug=False,
+            plot_improvements=True,
+            plot_dir="gantt_improvements_ts_region")
         gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
         better_gap = (best_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
         print(jsp_dataset["names"], f" Gap: {gap:.2f}", f" Better Gap: {better_gap:.2f}")
