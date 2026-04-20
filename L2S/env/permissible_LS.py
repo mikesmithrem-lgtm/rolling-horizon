@@ -10,6 +10,7 @@ def permissibleLeftShift(a, durMat, mchMat, mchsStartTimes, opIDsOnMchs):
     opsIDsForMchOfa = opIDsOnMchs[mch_a]
     flag = False
 
+    # 
     possiblePos = np.where(jobRdyTime_a < startTimesForMchOfa)[0]
     # print('possiblePos:', possiblePos)
     if len(possiblePos) == 0:
@@ -68,6 +69,7 @@ def calJobAndMchRdyTimeOfa(a, mchMat, durMat, mchsStartTimes, opIDsOnMchs):
     else:
         jobRdyTime_a = 0
     # cal mchRdyTime_a
+    # the logic is to find the scheduled ops on machine mch_a(np.where(opIDsOnMchs[mch_a]>=0)), choose the newest on([-1]) 
     mchPredecessor = opIDsOnMchs[mch_a][np.where(opIDsOnMchs[mch_a] >= 0)][-1] if len(np.where(opIDsOnMchs[mch_a] >= 0)[0]) != 0 else None
     if mchPredecessor is not None:
         durMchPredecessor = np.take(durMat, mchPredecessor)

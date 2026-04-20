@@ -907,20 +907,30 @@ class JsspWindow:
         current_graphs = []
         sub_graphs_mc = []
         for i, instance in enumerate(instances):
+            # [n_j, n_m]
             dur_mat, mch_mat = instance[0], instance[1]
             n_jobs, n_machines = dur_mat.shape[0], dur_mat.shape[1]
             n_operations = n_jobs * n_machines
+            # last_col: [n_j,], the last operation of each job
             last_col = np.arange(start=0, stop=n_operations, step=1).reshape(n_jobs, -1)[:, -1]
+            # candidate_oprs: [n_j,], the first operation of each job
             candidate_oprs = np.arange(start=0, stop=n_operations, step=1).reshape(n_jobs, -1)[:, 0]
+            # mask: [n_j,], true if a job finished
             mask = np.zeros(shape=n_jobs, dtype=bool)
+            # adj_mat_mc: [n_opr, n_opr], the disjunctive precedence
             adj_mat_mc = np.zeros(shape=[n_operations, n_operations], dtype=int)
 
+            # [n_m, n_j] 
+            # gant_chart: equal to op_start_times
+            # opIDsOnMchs: equal to orders
             gant_chart = -self.high * np.ones_like(dur_mat.transpose(), dtype=np.int32)
-            opIDsOnMchs = -n_jobs * np.ones_like(dur_mat.transpose(), dtype=np.int32)
+            opIDsOnMchs = -self.n_job * np.ones_like(dur_mat.transpose(), dtype=np.int32)
             finished_mark = np.zeros_like(mch_mat, dtype=np.int32)
 
             for _ in range(n_operations):
                 if rule_type == 'spt':
+                    # candidate_masked offers idx, and dur_candidate implies the duration.
+                    # shaped [n_job, ]
                     candidate_masked = candidate_oprs[np.where(~mask)]
                     dur_candidate = np.take(dur_mat, candidate_masked)
                     idx = np.random.choice(np.where(dur_candidate == np.min(dur_candidate))[0])
@@ -1411,9 +1421,9 @@ if __name__ == '__main__':
             raise TimeoutError(f"Time {solver.parameters.max_time_in_seconds} "
                             f"Not Enough For Generating Solutions")
     n_job, n_mch = 10, 10
-    low, high = 1, 100
-    num_instances = 1
-    env = JsspWindow(n_job, n_mch, low, high, cp_solver_time=1, cp_solver_cpu=1, cpu_budget=8, window_size=70)
+    low, high = 1, 99
+    num_instances = 4
+    env = JsspWindow(n_job, n_mch, low, high, cp_solver_time=1, cp_solver_cpu=1, cpu_budget=1, window_size=60)
     instances = [uni_instance_gen(n_job, n_mch, low, high) for _ in range(num_instances)]
     for instance in instances:
         job_data = np.stack((instance[1], instance[0]), axis=-1)
@@ -1422,7 +1432,8 @@ if __name__ == '__main__':
     instances = np.array(instances)
     states, feasible_actions, done = env.reset(instances, init_type='spt', device='cpu', plot=False)
     # print(states[0].shape, len(feasible_actions), done.shape)
-    for _ in range(10):
-        actions = [action[0] for action in feasible_actions]
+    for _ in range(50):
+        actions = [random.choice(action) for action in feasible_actions]
+        # actions = [action[0] for action in feasible_actions]
         states, reward, feasible_actions, done = env.step(actions, device='cpu', plot=False)
         # print(states[0].shape, reward.shape, len(feasible_actions), done.shape) 
