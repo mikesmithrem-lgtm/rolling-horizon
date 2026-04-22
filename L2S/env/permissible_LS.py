@@ -1,5 +1,5 @@
 import numpy as np
-from parameters import args
+# from L2S.parameters import args
 
 
 def permissibleLeftShift(a, durMat, mchMat, mchsStartTimes, opIDsOnMchs):
@@ -29,7 +29,8 @@ def permissibleLeftShift(a, durMat, mchMat, mchsStartTimes, opIDsOnMchs):
 def putInTheEnd(a, jobRdyTime_a, mchRdyTime_a, startTimesForMchOfa, opsIDsForMchOfa):
     # index = first position of -config.high in startTimesForMchOfa
     # print('Yes!OK!')
-    index = np.where(startTimesForMchOfa == -args.h)[0][0]
+    # args.h is 99
+    index = np.where(startTimesForMchOfa == -99)[0][0]
     startTime_a = max(jobRdyTime_a, mchRdyTime_a)
     startTimesForMchOfa[index] = startTime_a
     opsIDsForMchOfa[index] = a

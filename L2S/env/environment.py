@@ -4,6 +4,7 @@ import sys
 import multiprocessing as mp
 import json
 import logging
+from contextlib import contextmanager
 
 from torch_geometric.utils import add_self_loops, sort_edge_index
 
@@ -12,7 +13,7 @@ import torch
 import numpy as np
 import networkx as nx
 from ortools.sat.python import cp_model
-from generateJSP import uni_instance_gen
+from env.generateJSP import uni_instance_gen
 from env.permissible_LS import permissibleLeftShift
 from env.message_passing_evl import Evaluator, CPM_batch_G
 import matplotlib.pyplot as plt
@@ -39,6 +40,44 @@ class BatchGraph:
         self.edge_index_pc = None
         self.edge_index_mc = None
         self.batch = None
+
+
+def _available_nonzero_cpus():
+    """Return the current process affinity set without CPU0 when possible."""
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    current_cpus = set(os.sched_getaffinity(0))
+    nonzero_cpus = {cpu for cpu in current_cpus if cpu != 0}
+    return nonzero_cpus if nonzero_cpus else current_cpus
+
+
+@contextmanager
+def _temporary_nonzero_cpu_affinity():
+    """Temporarily pin the current process away from CPU0 during CP solving."""
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        yield
+        return
+
+    original_cpus = set(os.sched_getaffinity(0))
+    target_cpus = _available_nonzero_cpus()
+    if not target_cpus or target_cpus == original_cpus:
+        yield
+        return
+
+    os.sched_setaffinity(0, target_cpus)
+    try:
+        yield
+    finally:
+        os.sched_setaffinity(0, original_cpus)
+
+
+def _init_worker_nonzero_cpu_affinity():
+    """Bind worker processes to non-zero CPUs only."""
+    if not hasattr(os, "sched_setaffinity"):
+        return
+    target_cpus = _available_nonzero_cpus()
+    if target_cpus:
+        os.sched_setaffinity(0, target_cpus)
 
 
 def _window_node_to_job_op(node, n_mch):
@@ -147,11 +186,12 @@ def _window_solve_subproblem(instance, n_job, n_mch, ops_in_window, op_start_tim
         model.Add(makespan >= op_vars[(job, op)] + int(duration[job][op]))
     model.Minimize(makespan)
 
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = float(cp_solver_time)
-    solver.parameters.num_search_workers = int(cp_solver_cpu)
-    solver.parameters.random_seed = 0
-    status = solver.Solve(model)
+    with _temporary_nonzero_cpu_affinity():
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = float(cp_solver_time)
+        solver.parameters.num_search_workers = int(cp_solver_cpu)
+        solver.parameters.random_seed = 0
+        status = solver.Solve(model)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
@@ -702,6 +742,7 @@ class JsspWindow:
         self.cp_solver_time = cp_solver_time
         self.cp_solver_cpu = max(1, int(cp_solver_cpu))
         self.cpu_budget = max(1, int(cpu_budget))
+        self.available_cpus = _available_nonzero_cpus()
         self.window_size = max(1, min(window_size, self.n_oprs))
         # Matrix view of the current solution.
         self.current_start_times = None
@@ -1128,9 +1169,10 @@ class JsspWindow:
         """
         if task_count <= 0:
             return 0, self.cp_solver_cpu
-        worker_count = min(task_count, self.cpu_budget)
+        available_cpu_count = len(self.available_cpus) if self.available_cpus is not None else self.cpu_budget
+        worker_count = min(task_count, self.cpu_budget, max(1, available_cpu_count))
         cpu_per_task = max(1, self.cpu_budget // worker_count)
-        solver_cpu = min(self.cp_solver_cpu, cpu_per_task)
+        solver_cpu = min(self.cp_solver_cpu, cpu_per_task, max(1, available_cpu_count))
         return worker_count, solver_cpu
 
     def _merge_parallel_results(self, solved_payloads, plot=False):
@@ -1196,7 +1238,7 @@ class JsspWindow:
             solved_payloads = [_window_solve_single(task) for task in tasks]
         else:
             ctx = mp.get_context("fork")
-            with ctx.Pool(processes=worker_count) as pool:
+            with ctx.Pool(processes=worker_count, initializer=_init_worker_nonzero_cpu_affinity) as pool:
                 solved_payloads = pool.map(_window_solve_single, tasks)
 
         self._merge_parallel_results(solved_payloads, plot=plot)
@@ -1204,7 +1246,7 @@ class JsspWindow:
     def step(self, actions, device, plot=False):
         """Apply a batch of actions, update graphs, and return the next state."""
         iteration = self.itr
-        self._log_step_actions(iteration, actions)
+        # self._log_step_actions(iteration, actions)
         self.change_nxgraph_topology(actions, plot)
         x, edge_indices_pc, edge_indices_mc, batch, makespan = self.dag2pyg(self.instances, self.sub_graphs_mc, device)
         if self.reward_type == 'consecutive':
@@ -1230,7 +1272,7 @@ class JsspWindow:
                     self.tabu_lists[i].pop(0)
                 self.tabu_lists[i].append(action)
 
-        self._log_step_state(iteration, makespan)
+        # self._log_step_state(iteration, makespan)
         self.itr += 1
         feasible_actions, flag = self.feasible_actions(device)
         self.last_feasible_actions = feasible_actions
@@ -1268,7 +1310,7 @@ class JsspWindow:
         self._refresh_matrix_state()
         feasible_actions, flag = self.feasible_actions(device)
         self.last_feasible_actions = feasible_actions
-        self._log_reset_state(init_type)
+        # self._log_reset_state(init_type)
         return (x, edge_indices_pc, edge_indices_mc, batch), feasible_actions, ~flag
 
     def feasible_actions(self, device):
@@ -1353,16 +1395,17 @@ if __name__ == '__main__':
         model.Minimize(obj_var)
 
         # Solve model.
-        solver = cp_model.CpSolver()
-        # Set the maximum Time
-        solver.parameters.num_workers = 1
-        solver.parameters.max_memory_in_mb = 16 * 1024
-        solver.parameters.max_time_in_seconds = 10
-        # solver.parameters.use_parallel_search = True
-        # solver.parameters.log_search_progress = True
-        # solution_printer = SolutionPrinter()
-        # status = solver.Solve(model, solution_printer)
-        status = solver.Solve(model)
+        with _temporary_nonzero_cpu_affinity():
+            solver = cp_model.CpSolver()
+            # Set the maximum Time
+            solver.parameters.num_workers = 1
+            solver.parameters.max_memory_in_mb = 16 * 1024
+            solver.parameters.max_time_in_seconds = 10
+            # solver.parameters.use_parallel_search = True
+            # solver.parameters.log_search_progress = True
+            # solution_printer = SolutionPrinter()
+            # status = solver.Solve(model, solution_printer)
+            status = solver.Solve(model)
 
         # Output solution.
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
