@@ -3,6 +3,7 @@ Priority Dispatching Rules:
  - SPT: Shortest Processing Time
  - MWR: Most Work Remaining
  - MOR: Most Operations Remaining
+ - FDD_DIVIDE_MWKR: Flow Due Date divided by Work Remaining
 """
 import numpy as np
 from time import time
@@ -46,6 +47,17 @@ class MOR(Priority):
     def __call__(self, j, idx, costs, **kwargs):
         self._tie += self.tau       # Tie breaking
         return len(costs[j, idx:]) + self._tie
+
+
+class FDDDivideMWKR(Priority):
+    """Flow Due Date divided by Work Remaining (smaller is better)."""
+    name = 'FDD-DIVIDE-MWKR'
+
+    def __call__(self, j, idx, costs, **kwargs):
+        self._tie += self.tau
+        fdd = np.sum(costs[j, :idx + 1])
+        wkr = np.sum(costs[j, idx:])
+        return -(fdd / wkr) - self._tie
 
 
 class PDR(object):

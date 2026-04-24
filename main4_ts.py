@@ -871,9 +871,23 @@ if __name__ == "__main__":
     st = time()
 
     pdr = PDR(priority=SPT())
-    start_var = 21
-    end_var = 21
     count = 0
+
+    import numpy as np
+    test_dataset = np.load("./L2S/validation_data/validation_instance_20x15[1,99].npy", allow_pickle=True)
+    instance = [test_dataset[i] for i in range(test_dataset.shape[0])]
+    jsp_dataset = [{
+    "names": f"validation_instance_20x15_{idx}",
+    "j": 20,
+    "m": 15,
+    "duration": ins[0],
+    "mch": ins[1] - 1,
+    } for idx, ins in enumerate(instance)]
+    dataset = jsp_dataset
+
+    start_var = 0
+    end_var = len(dataset)
+
     for jsp_dataset in dataset:
         count += 1
         if not (count >= start_var and count <= end_var):
@@ -884,19 +898,22 @@ if __name__ == "__main__":
         assert ms == max(op_start_times[job][jsp_dataset["m"]-1] + jsp_dataset["duration"][job][jsp_dataset["m"]-1] for job in range(jsp_dataset["j"])), \
             f"计算的makespan {ms} 与根据op_start_times计算的makespan不一致 {max(op_start_times[job][jsp_dataset['m']-1] + jsp_dataset['duration'][job][jsp_dataset['m']-1] for job in range(jsp_dataset['j']))}"
         
-        print(f"Initial solution for {jsp_dataset['names']} has makespan {ms}, best known makespan {jsp_dataset['makespan']}")
+        # print(f"Initial solution for {jsp_dataset['names']} has makespan {ms}, best known makespan {jsp_dataset['makespan']}")
+        print(f"Initial solution for {jsp_dataset['names']} has makespan {ms}, no best known makespan")
         best_start_times, best_makespan = tabu_search_n5(
             jsp_dataset,
             op_start_times,
-            max_iterations=10000,
-            tabu_tenure=20,
+            max_iterations=500,
+            tabu_tenure=10,
             max_no_improve=None,
             debug=False,
             plot_improvements=False,
             plot_dir="gantt_improvements_tsonly",
         )
-        gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
-        better_gap = (best_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
+        # gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
+        # better_gap = (best_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
+        gap = ms 
+        better_gap = best_makespan
         print(jsp_dataset["names"], f" Gap: {gap:.2f}", f" Better Gap: {better_gap:.2f}")
         gaps.update(jsp_dataset, gap)
         better_gaps.update(jsp_dataset, better_gap)

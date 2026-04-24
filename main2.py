@@ -378,6 +378,8 @@ def large_neiborhood_search(
             critical_ops = trace_critical_path(start_op)
 
         # print(len(critical_ops), " critical operations in iteration ", it) 1746
+        # Debug
+        # critical_ops = [(job, op) for job in range(j) for op in range(m)]
         if len(critical_ops) == 0:
             window_idx = random.randint(0, nopr - window_size)
             raise AssertionError("没有找到关键路径上的操作，可能是计算lst时出现了问题")
@@ -919,7 +921,8 @@ def large_neiborhood_search(
                 makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
             # print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
         #print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
-        if makespan < best_makespan:
+        if makespan < best_makespan or True:
+            # Debug: 无脑接受新解，观察搜索过程中的解的变化情况
             count += 1
             previous_solution = [row[:] for row in best_solution]
             previous_makespan = best_makespan
@@ -1382,12 +1385,24 @@ if __name__ == "__main__":
     random.seed(0)
     st = time()
 
-    from pdrs import solve_instance, PDR, SPT
+    from pdrs import solve_instance, PDR, SPT, FDDDivideMWKR
 
-    pdr = PDR(priority=SPT())
-    start_var = 21
-    end_var = 21
+    pdr = PDR(priority=FDDDivideMWKR())
+    # Debug for validation
+    import numpy as np
+    test_dataset = np.load("./L2S/validation_data/validation_instance_20x15[1,99].npy", allow_pickle=True)
+    instance = [test_dataset[i] for i in range(test_dataset.shape[0])]
+    jsp_dataset = [{
+    "names": f"validation_instance_20x15_{idx}",
+    "j": 20,
+    "m": 15,
+    "duration": ins[0],
+    "mch": ins[1] - 1,
+    } for idx, ins in enumerate(instance)]
+    dataset = jsp_dataset
     count = 0
+    start_var = 1
+    end_var = len(dataset)
     for jsp_dataset in dataset:
         count += 1
         if not (count >= start_var and count <= end_var):
@@ -1399,7 +1414,7 @@ if __name__ == "__main__":
         #     continue
         # if jsp_dataset['names'].startswith("0") or jsp_dataset['names'].startswith("1") or jsp_dataset['names'].startswith("2") or jsp_dataset['names'].startswith("3"):
         #     continue
-        window_size = min(160, jsp_dataset["j"] * jsp_dataset["m"])
+        window_size = min(100, jsp_dataset["j"] * jsp_dataset["m"])
         sols, ms, times = solve_instance(jsp_dataset, pdr=pdr)
         
         op_start_times = convert_solution_to_start_times(sols, jsp_dataset)
@@ -1415,32 +1430,32 @@ if __name__ == "__main__":
         
         # op_start_times, ms = rolling_horizon_cp(jsp_dataset, window_size=window_size, roll_speed=10)
 
-        print(f"Initial solution for {jsp_dataset['names']} has makespan {ms} with window size {window_size}, best known makespan {jsp_dataset['makespan']}")
-        # print(f"Initial solution for {jsp_dataset['names']} has makespan {ms} with window size {window_size}, no best known makespan")
+        # print(f"Initial solution for {jsp_dataset['names']} has makespan {ms} with window size {window_size}, best known makespan {jsp_dataset['makespan']}")
+        print(f"Initial solution for {jsp_dataset['names']} has makespan {ms} with window size {window_size}, no best known makespan")
         better_solution, better_makespan = large_neiborhood_search(jsp_dataset, 
                                                                    op_start_times, 
                                                                    use_multi_window=False,
                                                                    window_size=window_size, 
-                                                                   max_iterations=1000, 
+                                                                   max_iterations=100, 
                                                                    debug="single_windows",
                                                                    cp_mode=False,
-                                                                   plot_improvements=True,
+                                                                   plot_improvements=False,
                                                                    plot_dir=f"gantt_improvements_cp_ta{start_var}")
         # print("调度结果开始时间：")
         # for job, starts in enumerate(op_start_times):
         #     print(f"Job {job}: {starts}")
         # print("Makespan:", ms)
-        gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
-        better_gap = (better_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
-        # gap = ms 
-        # better_gap = better_makespan
-        print(jsp_dataset["names"], f" Gap: {gap[0]:.2f}", f" Better Gap: {better_gap[0]:.2f}")
-        # print(jsp_dataset["names"], f" Gap: {gap:.2f}", f" Better Gap: {better_gap:.2f}")
-        # gaps.update(jsp_dataset, gap)
-        # better_gaps.update(jsp_dataset, better_gap)
+        # gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
+        # better_gap = (better_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
+        gap = ms 
+        better_gap = better_makespan
+        # print(jsp_dataset["names"], f" Gap: {gap[0]:.2f}", f" Better Gap: {better_gap[0]:.2f}")
+        print(jsp_dataset["names"], f" Gap: {gap:.2f}", f" Better Gap: {better_gap:.2f}")
+        gaps.update(jsp_dataset, gap)
+        better_gaps.update(jsp_dataset, better_gap)
         # break
-        gaps.update(jsp_dataset, gap[0])
-        better_gaps.update(jsp_dataset, better_gap[0])
+        # gaps.update(jsp_dataset, gap[0])
+        # better_gaps.update(jsp_dataset, better_gap[0])
         # plot_gantt(op_start_times, jsp_dataset, title=f"{jsp_dataset['names']}(makespan={better_gap[0]:.2f})")
     print("Overall Gaps:", gaps.avg)
     print(gaps)

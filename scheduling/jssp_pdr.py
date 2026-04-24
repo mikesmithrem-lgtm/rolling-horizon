@@ -11,7 +11,7 @@ from tqdm import tqdm
 from formats import JSSPInstance, JSSPSolution, INF
 from jssp_graph import JSSPGraph
 
-PDR_IDS = ["RND", "FIFO", "SPT", "MWKR", "MOPNR", "FDD", "FDD_MWKR"]
+PDR_IDS = ["RND", "FIFO", "SPT", "MWKR", "MOPNR", "FDD", "FDD_MWKR", "FDD-DIVIDE-MWKR"]
 
 
 class PDRState(NamedTuple):
@@ -184,8 +184,16 @@ class PriorityDispatchingRule:
 
     """
     def __init__(self, method: str = "FIFO"):
-        self.method = method.lower()
+        self.method = self._normalize_method(method)
         self._rnds = np.random.default_rng(1)
+
+    @staticmethod
+    def _normalize_method(method: str) -> str:
+        method = method.lower().replace("-", "_")
+        aliases = {
+            "fdd_divide_mwkr": "fdd_mwkr",
+        }
+        return aliases.get(method, method)
 
     def seed(self, seed: Optional[int] = None):
         self._rnds = np.random.default_rng(seed)

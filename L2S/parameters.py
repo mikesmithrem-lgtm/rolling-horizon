@@ -18,7 +18,7 @@ parser.add_argument('--heads', type=int, default=1)  # dghan parameters
 parser.add_argument('--drop_out', type=float, default=0.)  # dghan parameters
 # training parameters
 parser.add_argument('--lr', type=float, default=5e-5)
-parser.add_argument('--steps_learn', type=int, default=10)
+parser.add_argument('--steps_learn', type=int, default=5)
 parser.add_argument('--transit', type=int, default=100)
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--episodes', type=int, default=128000)
