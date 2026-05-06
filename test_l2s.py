@@ -27,6 +27,7 @@ if __name__ == '__main__':
     model_h = 99
     model_init_type = 'fdd-divide-mwkr'
     reward_type = 'yaoxin'  # 'yaoxin', 'consecutive'
+    zero_improvement_penalty = -3.0
     gamma = 1
 
     hidden_dim = 128
@@ -57,7 +58,16 @@ if __name__ == '__main__':
     p_j, p_m = 100, 20
     # read saved gap_against or use ortools to solve it.
 
-    env = JsspN5(n_job=p_j, n_mch=p_m, low=p_l, high=p_h, reward_type='yaoxin', fea_norm_const=fea_norm_const)
+    reward_tag = '{}_zip{:g}'.format(reward_type, zero_improvement_penalty)
+    env = JsspN5(
+        n_job=p_j,
+        n_mch=p_m,
+        low=p_l,
+        high=p_h,
+        reward_type='yaoxin',
+        zero_improvement_penalty=zero_improvement_penalty,
+        fea_norm_const=fea_norm_const,
+    )
     torch.manual_seed(seed)
     policy = Actor(in_dim=3,
                    hidden_dim=hidden_dim,
@@ -71,7 +81,7 @@ if __name__ == '__main__':
                        '{}_{}_{}_{}_{}_' \
                        '{}_{}_{}_{}_{}_{}' \
                        '.pth' \
-        .format(model_type, model_j, model_m, model_l, model_h, model_init_type, reward_type, gamma,
+        .format(model_type, model_j, model_m, model_l, model_h, model_init_type, reward_tag, gamma,
                 hidden_dim, embedding_layer, policy_layer, embedding_type, dghan_param_for_saved_model,
                 lr, steps_learn, training_episode_length, batch_size, episodes, step_validation)
     print('loading model from:', saved_model_path)

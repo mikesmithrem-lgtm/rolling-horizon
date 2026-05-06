@@ -40,6 +40,10 @@ def _bind_main_process_away_from_cpu0():
     return set(os.sched_getaffinity(0))
 
 
+def _reward_tag():
+    return '{}_zip{:g}'.format(args.reward_type, args.zero_improvement_penalty)
+
+
 class RL2S4JSSP:
     def __init__(self):
         _ensure_dirs()
@@ -49,6 +53,7 @@ class RL2S4JSSP:
             low=args.l,
             high=args.h,
             reward_type=args.reward_type,
+            zero_improvement_penalty=args.zero_improvement_penalty,
         )
         self.env_validation = JsspN5(
             n_job=args.j,
@@ -56,6 +61,7 @@ class RL2S4JSSP:
             low=args.l,
             high=args.h,
             reward_type=args.reward_type,
+            zero_improvement_penalty=args.zero_improvement_penalty,
         )
         self.eps = np.finfo(np.float32).eps.item()
         self.tensorboard_root = Path(getattr(args, 'tensorboard_log_dir', './runs'))
@@ -87,7 +93,7 @@ class RL2S4JSSP:
             '{}_{}_{}_{}_{}_'
             '{}_{}_{}_{}_{}_{}'
         ).format(
-            args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma,
+            args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma,
             args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
             args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
         )
@@ -143,7 +149,7 @@ class RL2S4JSSP:
                     '{}_{}_{}_{}_{}_{}'
                     '.pth'
                 ).format(
-                    args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma,
+                    args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma,
                     args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
                     args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
                 ),
@@ -160,7 +166,7 @@ class RL2S4JSSP:
                     '{}_{}_{}_{}_{}_{}'
                     '.pth'
                 ).format(
-                    args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma,
+                    args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma,
                     args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
                     args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
                 ),
@@ -278,7 +284,7 @@ class RL2S4JSSP:
                         '{}_{}_{}_{}_{}_'
                         '{}_{}_{}_{}_{}_{}.npy'
                     ).format(
-                        args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma,
+                        args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma,
                         args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type,
                         self.dghan_param_for_saved_model,
                         args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
@@ -292,7 +298,7 @@ class RL2S4JSSP:
                         '{}_{}_{}_{}_{}_'
                         '{}_{}_{}_{}_{}_{}.npy'
                     ).format(
-                        args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma,
+                        args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma,
                         args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type,
                         self.dghan_param_for_saved_model,
                         args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
@@ -324,6 +330,7 @@ class RL2SCPJSSP:
             window_size=self.window_size,
             log_path=self.training_env_log_path,
             reward_type=args.reward_type,
+            zero_improvement_penalty=args.zero_improvement_penalty,
         )
         self.env_validation = JsspWindow(
             n_job=args.j,
@@ -336,6 +343,7 @@ class RL2SCPJSSP:
             window_size=self.window_size,
             log_path=self.validation_env_log_path,
             reward_type=args.reward_type,
+            zero_improvement_penalty=args.zero_improvement_penalty,
         )
         self.eps = np.finfo(np.float32).eps.item()
         validation_data_path = VALIDATION_DIR / 'validation_instance_{}x{}[{},{}].npy'.format(
@@ -374,7 +382,7 @@ class RL2SCPJSSP:
             '{}_{}_{}_{}_{}_'
             '{}_{}_{}_{}_{}_{}'
         ).format(
-            args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma, self._cp_run_tag(),
+            args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
             args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
             args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
         )
@@ -430,7 +438,7 @@ class RL2SCPJSSP:
                     '{}_{}_{}_{}_{}_{}'
                     '.pth'
                 ).format(
-                    args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma, self._cp_run_tag(),
+                    args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
                     args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
                     args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
                 ),
@@ -447,7 +455,7 @@ class RL2SCPJSSP:
                     '{}_{}_{}_{}_{}_{}'
                     '.pth'
                 ).format(
-                    args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma, self._cp_run_tag(),
+                    args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
                     args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
                     args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
                 ),
@@ -508,6 +516,7 @@ class RL2SCPJSSP:
                 batch_data.wrapper(*states)
                 actions, log_ps = policy(batch_data, feasible_actions)
                 states, rewards, feasible_actions, dones = self.env_training.step(actions, dev)
+                # print('Batch {}, step {}, reward_each: {}'.format(batch_i, self.env_training.itr, rewards.cpu().numpy()))
                 reward_mean = rewards.mean().cpu().item()
                 reward_log.append(reward_mean)
                 writer.add_scalar('train/reward_step', reward_mean, train_step)
@@ -564,7 +573,7 @@ class RL2SCPJSSP:
                         '{}_{}_{}_{}_{}_'
                         '{}_{}_{}_{}_{}_{}.npy'
                     ).format(
-                        args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma, self._cp_run_tag(),
+                        args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
                         args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type,
                         self.dghan_param_for_saved_model,
                         args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,
@@ -578,7 +587,7 @@ class RL2SCPJSSP:
                         '{}_{}_{}_{}_{}_'
                         '{}_{}_{}_{}_{}_{}.npy'
                     ).format(
-                        args.j, args.m, args.l, args.h, args.init_type, args.reward_type, args.gamma, self._cp_run_tag(),
+                        args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
                         args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type,
                         self.dghan_param_for_saved_model,
                         args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation,

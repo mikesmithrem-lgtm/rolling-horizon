@@ -130,6 +130,7 @@ class Actor(nn.Module):
         self.embedding_l = embedding_l
         self.policy_l = policy_l
         self.embedding_type = embedding_type
+        self.hidden_dim = hidden_dim
         if self.embedding_type == 'gin':
             self.embedding = GIN(in_dim=in_dim, hidden_dim=hidden_dim, layer_gin=embedding_l)
         elif self.embedding_type == 'dghan':
@@ -172,6 +173,48 @@ class Actor(nn.Module):
                                                   torch.nn.Tanh(),
                                                   Linear(hidden_dim, hidden_dim)))
 
+        self.machine_window_encoder = Sequential(Linear(4, hidden_dim),
+                                                 torch.nn.Tanh(),
+                                                 Linear(hidden_dim, hidden_dim))
+        self.machine_window_policy = Sequential(Linear(hidden_dim * 3, hidden_dim),
+                                                torch.nn.Tanh(),
+                                                Linear(hidden_dim, 1))
+
+    def _machine_window_bonus(self, node_embed_augmented, feasible_actions, action_machine_avail):
+        """Score feasible actions with the rolling-window machine availability branch."""
+        if action_machine_avail is None:
+            return None
+
+        device = node_embed_augmented.device
+        batch_size, n_nodes_per_state = node_embed_augmented.shape[:2]
+        action_bonus = torch.zeros((batch_size, n_nodes_per_state, n_nodes_per_state),
+                                   dtype=node_embed_augmented.dtype,
+                                   device=device)
+
+        for batch_idx, (state_actions, state_machine_avail) in enumerate(zip(feasible_actions, action_machine_avail)):
+            if state_machine_avail is None or len(state_actions) == 0:
+                continue
+            if state_machine_avail.shape[0] != len(state_actions):
+                raise ValueError('machine availability features must align with feasible actions.')
+
+            action_index = torch.as_tensor(state_actions, dtype=torch.long, device=device)
+            src_idx = action_index[:, 0]
+            dst_idx = action_index[:, 1]
+
+            machine_mask = state_machine_avail[..., -1:].to(dtype=node_embed_augmented.dtype)
+            machine_embed = self.machine_window_encoder(
+                state_machine_avail.reshape(-1, state_machine_avail.size(-1))
+            ).reshape(state_machine_avail.size(0), state_machine_avail.size(1), self.hidden_dim)
+            valid_machine_count = machine_mask.sum(dim=1).clamp(min=1.0)
+            window_embed = (machine_embed * machine_mask).sum(dim=1) / valid_machine_count
+
+            action_repr = torch.cat([node_embed_augmented[batch_idx, src_idx],
+                                     node_embed_augmented[batch_idx, dst_idx],
+                                     window_embed], dim=-1)
+            action_bonus[batch_idx, src_idx, dst_idx] = self.machine_window_policy(action_repr).squeeze(-1)
+
+        return action_bonus
+
     def forward(self, batch_states, feasible_actions):
 
         if self.embedding_type == 'gin':
@@ -211,6 +254,13 @@ class Actor(nn.Module):
 
         # action score
         action_score = torch.bmm(node_embed_augmented, node_embed_augmented.transpose(-1, -2))
+        action_window_bonus = self._machine_window_bonus(
+            node_embed_augmented,
+            feasible_actions,
+            getattr(batch_states, 'feasible_action_machine_avail', None),
+        )
+        if action_window_bonus is not None:
+            action_score = action_score + action_window_bonus
 
         # prepare mask
         carries = np.arange(0, batch_size * n_nodes_per_state, n_nodes_per_state)

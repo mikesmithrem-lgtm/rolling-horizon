@@ -28,18 +28,21 @@ class BatchGraph:
         self.edge_index_pc = None
         self.edge_index_mc = None
         self.batch = None
+        self.feasible_action_machine_avail = None
 
-    def wrapper(self, x, edge_index_pc, edge_index_mc, batch):
+    def wrapper(self, x, edge_index_pc, edge_index_mc, batch, feasible_action_machine_avail=None):
         self.x = x
         self.edge_index_pc = edge_index_pc
         self.edge_index_mc = edge_index_mc
         self.batch = batch
+        self.feasible_action_machine_avail = feasible_action_machine_avail
 
     def clean(self):
         self.x = None
         self.edge_index_pc = None
         self.edge_index_mc = None
         self.batch = None
+        self.feasible_action_machine_avail = None
 
 
 def _available_nonzero_cpus():
@@ -78,6 +81,15 @@ def _init_worker_nonzero_cpu_affinity():
     target_cpus = _available_nonzero_cpus()
     if target_cpus:
         os.sched_setaffinity(0, target_cpus)
+
+
+def _apply_zero_improvement_penalty(reward, zero_improvement_penalty):
+    """Penalize no-improvement transitions with a fixed reward."""
+    zero_reward_mask = torch.isclose(reward, torch.zeros_like(reward))
+    if not torch.any(zero_reward_mask):
+        return reward
+    penalty = torch.full_like(reward, fill_value=zero_improvement_penalty)
+    return torch.where(zero_reward_mask, penalty, reward)
 
 
 def _window_node_to_job_op(node, n_mch):
@@ -308,7 +320,17 @@ def _window_solve_single(args):
 
 
 class JsspN5:
-    def __init__(self, n_job, n_mch, low, high, reward_type='yaoxin', fea_norm_const=1000, evaluator_type='message-passing'):
+    def __init__(
+        self,
+        n_job,
+        n_mch,
+        low,
+        high,
+        reward_type='yaoxin',
+        zero_improvement_penalty=-3.0,
+        fea_norm_const=1000,
+        evaluator_type='message-passing',
+    ):
 
         self.n_job = n_job
         self.n_mch = n_mch
@@ -324,6 +346,7 @@ class JsspN5:
         self.tabu_lists = None
         self.incumbent_objs = None
         self.reward_type = reward_type
+        self.zero_improvement_penalty = float(zero_improvement_penalty)
         self.fea_norm_const = fea_norm_const
         self.evaluator_type = evaluator_type
         self.eva = Evaluator() if evaluator_type == 'message-passing' else CPM_batch_G
@@ -640,9 +663,14 @@ class JsspN5:
         if self.reward_type == 'consecutive':
             reward = self.current_objs - makespan
         elif self.reward_type == 'yaoxin':
-            reward = torch.where(self.incumbent_objs - makespan > 0, self.incumbent_objs - makespan, torch.tensor(0, dtype=torch.float32, device=device))
+            reward = torch.where(
+                self.incumbent_objs - makespan > 0,
+                self.incumbent_objs - makespan,
+                torch.zeros_like(makespan),
+            )
         else:
             raise ValueError('reward type must be "yaoxin" or "consecutive".')
+        reward = _apply_zero_improvement_penalty(reward, self.zero_improvement_penalty)
 
         self.incumbent_objs = torch.where(makespan - self.incumbent_objs < 0, makespan, self.incumbent_objs)
         self.current_objs = makespan
@@ -665,7 +693,7 @@ class JsspN5:
 
         feasible_actions, flag = self.feasible_actions(device)  # new feasible actions w.r.t updated tabu list
 
-        return (x, edge_indices_pc, edge_indices_mc, batch), reward, feasible_actions, ~flag
+        return (x, edge_indices_pc, edge_indices_mc, batch, None), reward, feasible_actions, ~flag
 
     def reset(self, instances, init_type, device, plot=False):
         '''
@@ -696,7 +724,7 @@ class JsspN5:
         self.tabu_lists = [[] for _ in range(instances.shape[0])]
         feasible_actions, flag = self.feasible_actions(device)
 
-        return (x, edge_indices_pc, edge_indices_mc, batch), feasible_actions, ~flag
+        return (x, edge_indices_pc, edge_indices_mc, batch, None), feasible_actions, ~flag
 
     def feasible_actions(self, device):
         actions = []
@@ -720,7 +748,10 @@ class JsspWindow:
                  cpu_budget=16,
                  window_size=100,
                  log_path='jssp_window.log',
-                 reward_type='yaoxin', fea_norm_const=1000, evaluator_type='message-passing'):
+                 reward_type='yaoxin',
+                 zero_improvement_penalty=-3.0,
+                 fea_norm_const=1000,
+                 evaluator_type='message-passing'):
         self.n_job = n_job
         self.n_mch = n_mch
         self.n_oprs = self.n_job * self.n_mch
@@ -735,6 +766,7 @@ class JsspWindow:
         self.tabu_lists = None
         self.incumbent_objs = None
         self.reward_type = reward_type
+        self.zero_improvement_penalty = float(zero_improvement_penalty)
         self.fea_norm_const = fea_norm_const
         self.evaluator_type = evaluator_type
         self.eva = Evaluator() if evaluator_type == 'message-passing' else CPM_batch_G
@@ -1121,9 +1153,64 @@ class JsspWindow:
         """Pick the operations belonging to one rolling window."""
         return _window_plan_ops(op_start_times, self.n_job, self.n_mch, self.window_size, anchor_node)
 
+    def _window_sorted_ops(self, op_start_times):
+        """Cacheable sorted operation order for all anchor-based windows in one state."""
+        sorted_ops = sorted(
+            [(job, op) for job in range(self.n_job) for op in range(self.n_mch)],
+            key=lambda item: (op_start_times[item[0]][item[1]], item[0], item[1]),
+        )
+        index_by_op = {op: idx for idx, op in enumerate(sorted_ops)}
+        return sorted_ops, index_by_op
+
+    def _plan_window_from_sorted_ops(self, sorted_ops, index_by_op, anchor_node):
+        """Reuse the per-state sorted operation order when expanding one anchor window."""
+        anchor = self._node_to_job_op(anchor_node)
+        window_idx = index_by_op[anchor]
+        if window_idx > self.n_oprs - self.window_size:
+            window_idx = self.n_oprs - self.window_size
+        return sorted_ops[window_idx:window_idx + self.window_size]
+
     def _get_machine_window_availability(self, ops_in_window, op_start_times, duration, mch):
         """Expose the window boundary calculation as a class method too."""
         return _window_machine_availability(ops_in_window, op_start_times, duration, mch, self.n_job, self.n_mch)
+
+    def _machine_avail_to_tensor(self, machine_avail, ops_in_window, duration, mch, device):
+        """Convert sparse machine intervals to a dense tensor for the policy side branch."""
+        machine_tensor = torch.zeros((self.n_mch, 4), dtype=torch.float, device=device)
+        for machine_idx, (earliest, latest) in machine_avail.items():
+            machine_window_load = sum(
+                float(duration[job][op])
+                for job, op in ops_in_window
+                if self._machine_to_index(mch[job][op]) == machine_idx
+            )
+            assert machine_window_load <= float(latest - earliest), "Machine load cannot exceed the window size."
+            machine_slack = max(float(latest - earliest) - machine_window_load, 0.0)
+            machine_tensor[machine_idx, 0] = float(earliest) / self.fea_norm_const
+            machine_tensor[machine_idx, 1] = float(latest) / self.fea_norm_const
+            machine_tensor[machine_idx, 2] = machine_slack / self.fea_norm_const
+            machine_tensor[machine_idx, 3] = 1.0
+        return machine_tensor
+
+    def _build_action_machine_availability(self, instance, start_times, actions, device):
+        """Build one machine-availability tensor per feasible action."""
+        if len(actions) == 0:
+            return torch.zeros((0, self.n_mch, 4), dtype=torch.float, device=device)
+
+        sorted_ops, index_by_op = self._window_sorted_ops(start_times)
+        duration = instance[0]
+        mch = instance[1]
+        action_machine_avail = []
+        for action in actions:
+            anchor_node = int(action[0])
+            if anchor_node <= 0 or anchor_node > self.n_oprs:
+                action_machine_avail.append(torch.zeros((self.n_mch, 4), dtype=torch.float, device=device))
+                continue
+            ops_in_window = self._plan_window_from_sorted_ops(sorted_ops, index_by_op, anchor_node)
+            machine_avail = self._get_machine_window_availability(ops_in_window, start_times, duration, mch)
+            action_machine_avail.append(
+                self._machine_avail_to_tensor(machine_avail, ops_in_window, duration, mch, device)
+            )
+        return torch.stack(action_machine_avail, dim=0)
 
     def _solve_window_with_machine_avail(self, instance, ops_in_window, op_start_times, machine_avail):
         """Solve one window in the current process."""
@@ -1255,10 +1342,11 @@ class JsspWindow:
             reward = torch.where(
                 self.incumbent_objs - makespan > 0,
                 self.incumbent_objs - makespan,
-                torch.tensor(0, dtype=torch.float32, device=device),
+                torch.zeros_like(makespan),
             )
         else:
             raise ValueError('reward type must be "yaoxin" or "consecutive".')
+        reward = _apply_zero_improvement_penalty(reward, self.zero_improvement_penalty)
 
         self.incumbent_objs = torch.where(makespan - self.incumbent_objs < 0, makespan, self.incumbent_objs)
         self.current_objs = makespan
@@ -1274,9 +1362,9 @@ class JsspWindow:
 
         # self._log_step_state(iteration, makespan)
         self.itr += 1
-        feasible_actions, flag = self.feasible_actions(device)
+        feasible_actions, flag, action_machine_avail = self.feasible_actions(device)
         self.last_feasible_actions = feasible_actions
-        return (x, edge_indices_pc, edge_indices_mc, batch), reward, feasible_actions, ~flag
+        return (x, edge_indices_pc, edge_indices_mc, batch, action_machine_avail), reward, feasible_actions, ~flag
 
     def reset(self, instances, init_type, device, plot=False):
         """Initialize one batch of instances and construct both graph and matrix views."""
@@ -1308,16 +1396,17 @@ class JsspWindow:
         self.itr = 0
         self.tabu_lists = [[] for _ in range(instances.shape[0])]
         self._refresh_matrix_state()
-        feasible_actions, flag = self.feasible_actions(device)
+        feasible_actions, flag, action_machine_avail = self.feasible_actions(device)
         self.last_feasible_actions = feasible_actions
         # self._log_reset_state(init_type)
-        return (x, edge_indices_pc, edge_indices_mc, batch), feasible_actions, ~flag
+        return (x, edge_indices_pc, edge_indices_mc, batch, action_machine_avail), feasible_actions, ~flag
 
     def feasible_actions(self, device):
         """Enumerate one candidate action list for each batch item."""
         actions = []
+        action_machine_avail = []
         feasible_actions_flag = []
-        for G, instance, tabu_list in zip(self.current_graphs, self.instances, self.tabu_lists):
+        for G, instance, tabu_list, start_times in zip(self.current_graphs, self.instances, self.tabu_lists, self.current_start_times):
             action = self._gen_moves(solution=G, mch_mat=instance[1], tabu_list=tabu_list)
             if len(action) != 0:
                 actions.append(action)
@@ -1325,7 +1414,10 @@ class JsspWindow:
             else:
                 actions.append([[0, 0]])
                 feasible_actions_flag.append(False)
-        return actions, torch.tensor(feasible_actions_flag, device=device).unsqueeze(1)
+            action_machine_avail.append(
+                self._build_action_machine_availability(instance, start_times, actions[-1], device)
+            )
+        return actions, torch.tensor(feasible_actions_flag, device=device).unsqueeze(1), action_machine_avail
 
 if __name__ == '__main__':
     from generateJSP import uni_instance_gen

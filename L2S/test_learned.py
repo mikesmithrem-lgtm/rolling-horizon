@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument('--h', type=int, default=99)
     parser.add_argument('--init_type', type=str, default='fdd-divide-mwkr')
     parser.add_argument('--reward_type', type=str, default='yaoxin')
+    parser.add_argument('--zero_improvement_penalty', type=float, default=-3.0)
     parser.add_argument('--gamma', type=float, default=1)
 
     parser.add_argument('--hidden_dim', type=int, default=128)
@@ -42,8 +43,8 @@ def parse_args():
     parser.add_argument('--drop_out', type=float, default=0.0)
 
     parser.add_argument('--lr', type=float, default=5e-5)
-    parser.add_argument('--steps_learn', type=int, default=5)
-    parser.add_argument('--transit', type=int, default=100)
+    parser.add_argument('--steps_learn', type=int, default=10)
+    parser.add_argument('--transit', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--episodes', type=int, default=128000)
     parser.add_argument('--step_validation', type=int, default=10)
@@ -93,6 +94,10 @@ def _cp_run_tag(test_args):
     )
 
 
+def _reward_tag(test_args):
+    return '{}_zip{:g}'.format(test_args.reward_type, test_args.zero_improvement_penalty)
+
+
 def _default_model_path(test_args):
     return MODEL_DIR / (
         '{}_{}x{}[{},{}]_{}_{}_{}_{}_'
@@ -102,7 +107,7 @@ def _default_model_path(test_args):
     ).format(
         test_args.model_type,
         test_args.j, test_args.m, test_args.l, test_args.h,
-        test_args.init_type, test_args.reward_type, test_args.gamma, _cp_run_tag(test_args),
+        test_args.init_type, _reward_tag(test_args), test_args.gamma, _cp_run_tag(test_args),
         test_args.hidden_dim, test_args.embedding_layer, test_args.policy_layer,
         test_args.embedding_type, _dghan_param_for_saved_model(test_args),
         test_args.lr, test_args.steps_learn, test_args.transit,
@@ -266,6 +271,7 @@ def main():
         window_size=test_args.window_size,
         log_path=None,
         reward_type=test_args.reward_type,
+        zero_improvement_penalty=test_args.zero_improvement_penalty,
     )
     policy = _build_policy(test_args, device)
     policy.load_state_dict(torch.load(model_path, map_location=torch.device(device)))
