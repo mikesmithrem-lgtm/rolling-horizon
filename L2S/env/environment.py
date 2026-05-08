@@ -169,7 +169,7 @@ def _window_solve_subproblem(instance, n_job, n_mch, ops_in_window, op_start_tim
             lb = max(lb, prev_end)
         if op < n_mch - 1 and (job, op + 1) not in ops_in_window:
             after_start = int(op_start_times[job][op + 1])
-            ub = min(ub, after_start)
+            ub = min(ub, after_start - int(duration[job][op]))
         if lb > ub:
             return None
         op_vars[(job, op)] = model.NewIntVar(lb, ub, f"start_{job}_{op}")

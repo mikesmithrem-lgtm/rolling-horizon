@@ -173,6 +173,7 @@ class Actor(nn.Module):
                                                   torch.nn.Tanh(),
                                                   Linear(hidden_dim, hidden_dim)))
 
+        # Debug: If l2s_test is False, Activate it
         self.machine_window_encoder = Sequential(Linear(4, hidden_dim),
                                                  torch.nn.Tanh(),
                                                  Linear(hidden_dim, hidden_dim))
@@ -215,7 +216,7 @@ class Actor(nn.Module):
 
         return action_bonus
 
-    def forward(self, batch_states, feasible_actions):
+    def forward(self, batch_states, feasible_actions, l2s_test=False):
 
         if self.embedding_type == 'gin':
             node_embed, graph_embed = self.embedding(batch_states.x,
@@ -254,13 +255,14 @@ class Actor(nn.Module):
 
         # action score
         action_score = torch.bmm(node_embed_augmented, node_embed_augmented.transpose(-1, -2))
-        action_window_bonus = self._machine_window_bonus(
-            node_embed_augmented,
-            feasible_actions,
-            getattr(batch_states, 'feasible_action_machine_avail', None),
-        )
-        if action_window_bonus is not None:
-            action_score = action_score + action_window_bonus
+        if not l2s_test:
+            action_window_bonus = self._machine_window_bonus(
+                node_embed_augmented,
+                feasible_actions,
+                getattr(batch_states, 'feasible_action_machine_avail', None),
+            )
+            if action_window_bonus is not None:
+                action_score = action_score + action_window_bonus
 
         # prepare mask
         carries = np.arange(0, batch_size * n_nodes_per_state, n_nodes_per_state)

@@ -564,7 +564,7 @@ def main():
     )
     parser.add_argument("--start", type=int, default=1)
     parser.add_argument("--end", type=int, default=None)
-    parser.add_argument("--max-iterations", type=int, default=50)
+    parser.add_argument("--max-iterations", type=int, default=100)
     parser.add_argument("--cp-time-limit", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--debug", action="store_true")

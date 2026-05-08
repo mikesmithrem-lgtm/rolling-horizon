@@ -94,7 +94,7 @@ def solve_window_with_machine_avail(jsp_instance,
         if op < m - 1 and (job, op + 1) not in ops_in_window:
             # 如果后一个操作不在窗口内，确保当前操作的开始时间不晚于后一个操作的开始时间
             after_start = op_start_times[job][op + 1]
-            ub = min(ub, after_start)
+            ub = min(ub, after_start - duration[job][op])
         # lb = 0
         # ub = horizon
         op_vars[(job, op)] = model.NewIntVar(lb, ub, f'start_{job}_{op}')
@@ -285,6 +285,80 @@ def get_machine_window_availability(ops_in_window, op_start_times, duration, mch
         machine_avail[machine] = (earliest, latest)
     return machine_avail
 
+
+def summarize_window_machine_intervals(jsp_instance, ops_in_window, start_times_by_op):
+    duration = jsp_instance["duration"]
+    mch = jsp_instance["mch"]
+    machine_stats = {}
+    for job, op in ops_in_window:
+        machine = mch[job][op]
+        start_time = start_times_by_op[(job, op)]
+        end_time = start_time + duration[job][op]
+        if machine not in machine_stats:
+            machine_stats[machine] = {
+                "earliest_start": start_time,
+                "latest_end": end_time,
+                "ops": [(job, op)],
+            }
+        else:
+            machine_stats[machine]["earliest_start"] = min(
+                machine_stats[machine]["earliest_start"], start_time
+            )
+            machine_stats[machine]["latest_end"] = max(
+                machine_stats[machine]["latest_end"], end_time
+            )
+            machine_stats[machine]["ops"].append((job, op))
+    return machine_stats
+
+
+def print_window_machine_interval_comparison(
+    jsp_instance,
+    ops_in_window,
+    original_start_times,
+    machine_avail,
+    window_result,
+    window_idx,
+    iteration,
+):
+    before_stats = summarize_window_machine_intervals(
+        jsp_instance,
+        ops_in_window,
+        {(job, op): original_start_times[job][op] for job, op in ops_in_window},
+    )
+    after_stats = summarize_window_machine_intervals(
+        jsp_instance,
+        ops_in_window,
+        window_result,
+    )
+
+    print(f"Iteration {iteration}, window {window_idx}: machine interval comparison")
+    for machine in sorted(machine_avail):
+        avail_start, avail_end = machine_avail[machine]
+        avail_span = avail_end - avail_start
+        before = before_stats[machine]
+        after = after_stats[machine]
+        before_span = before["latest_end"] - before["earliest_start"]
+        after_span = after["latest_end"] - after["earliest_start"]
+
+        if after["earliest_start"] < avail_start or after["latest_end"] > avail_end:
+            compression = "out_of_bounds"
+        elif after_span < avail_span:
+            compression = "compressed"
+        elif after_span == avail_span:
+            compression = "unchanged"
+        else:
+            compression = "expanded"
+
+        print(
+            f"  machine {machine}: "
+            f"avail=[{avail_start}, {avail_end}] span={avail_span}; "
+            f"before=[{before['earliest_start']}, {before['latest_end']}] span={before_span}; "
+            f"after=[{after['earliest_start']}, {after['latest_end']}] span={after_span}; "
+            f"delta_start={after['earliest_start'] - before['earliest_start']}, "
+            f"delta_end={after['latest_end'] - before['latest_end']}, "
+            f"vs_avail={compression}, ops={sorted(after['ops'])}"
+        )
+
 def large_neiborhood_search(
     jsp_instance: dict, 
     est: list, 
@@ -379,7 +453,7 @@ def large_neiborhood_search(
 
         # print(len(critical_ops), " critical operations in iteration ", it) 1746
         # Debug
-        # critical_ops = [(job, op) for job in range(j) for op in range(m)]
+        critical_ops = [(job, op) for job in range(j) for op in range(m)]
         if len(critical_ops) == 0:
             window_idx = random.randint(0, nopr - window_size)
             raise AssertionError("没有找到关键路径上的操作，可能是计算lst时出现了问题")
@@ -873,6 +947,17 @@ def large_neiborhood_search(
                 if not window_result:
                     continue  # 优化失败，跳过
 
+                ref_start_times = [row[:] for row in op_start_times]
+                # print_window_machine_interval_comparison(
+                #     jsp_instance,
+                #     ops_in_window,
+                #     op_start_times,
+                #     machine_avail,
+                #     window_result,
+                #     window_idx,
+                #     it,
+                # )
+
                 # 更新窗口内操作的开始时间
                 original_max_time = 0
                 for (job, op), st in window_result.items():
@@ -880,50 +965,60 @@ def large_neiborhood_search(
                     # print(f"For job ({job}, {op}), original start time: {op_start_times[job][op]}, new start time: {st}")
                     op_start_times[job][op] = st
 
-                # 计算每个机器最早可用时间
-                machine_est = {}
-                # 1. 先找出每台机器上，ops_in_window及其之前所有操作的最大结束时间
-                # if debug:
-                #     ops_in_window.sort(key=lambda x: window_result[(x[0], x[1])])
-                #     sorted_ops[window_idx:window_idx + window_size] = ops_in_window
+                orders = [[] for _ in range(m)]
+                for machine in range(m):
+                    machine_ops = [
+                        (job, op)
+                        for job in range(j)
+                        for op in range(m)
+                        if jsp_instance["mch"][job][op] == machine
+                    ]
+                    machine_ops.sort(
+                        key=lambda item: (
+                            op_start_times[item[0]][item[1]],
+                            ref_start_times[item[0]][item[1]],
+                            item[0],
+                            item[1],
+                        )
+                    )
+                    orders[machine] = machine_ops
 
-                for ops in sorted_ops[:window_idx + window_size]:
-                    job, op = ops
-                    machine = jsp_instance["mch"][job][op]
-                    end_time = op_start_times[job][op] + duration[job][op]
-                    if machine not in machine_est:
-                        machine_est[machine] = end_time
-                    else:
-                        machine_est[machine] = max(machine_est[machine], end_time)
+                rebuilt_start_times = [[0] * m for _ in range(j)]
+                machine_ready = [0] * m
+                job_ready = [0] * j
+                order_idx = [0] * m
+                scheduled_ops = set()
+                while len(scheduled_ops) < nopr:
+                    progress = False
+                    for machine in range(m):
+                        if order_idx[machine] >= len(orders[machine]):
+                            continue
+                        job, op = orders[machine][order_idx[machine]]
+                        if (job, op) in scheduled_ops:
+                            order_idx[machine] += 1
+                            continue
+                        if op > 0 and (job, op - 1) not in scheduled_ops:
+                            continue
 
-                after_max_time = max(machine_est[i] for i in machine_est.keys())
-                # if after_max_time == original_max_time:
-                #     print(f"Iteration {it} find new solution but no improvement")
-                # elif after_max_time > original_max_time:
-                #     print(f"Iteration {it} find worse solution")
-                # assert after_max_time <= original_max_time, f"机器最早可用时间不应该变晚: {after_max_time} vs {original_max_time}"
-                # print(f"After window update, max machine earliest time is {after_max_time}, original max time was {original_max_time}")
-                # 2. 重新计算ops_after_window的操作开始时间，保证顺序不变且满足机器最早可用时间
-                ops_after_window = sorted_ops[window_idx + window_size:]
-                for job, op in ops_after_window:
-                    # 工件顺序约束
-                    machine = jsp_instance["mch"][job][op]
-                    if machine not in machine_est:
-                        machine_est[machine] = 0
-                    if op > 0:
-                        op_start_times[job][op] = max(op_start_times[job][op-1] + duration[job][op-1], machine_est[machine])
-                    else:
-                        op_start_times[job][op] = machine_est[machine]
-                    # 更新该机器的最早可用时间
-                    machine_est[machine] = op_start_times[job][op] + duration[job][op]
+                        start_time = max(job_ready[job], machine_ready[machine])
+                        rebuilt_start_times[job][op] = start_time
+                        end_time = start_time + duration[job][op]
+                        job_ready[job] = end_time
+                        machine_ready[machine] = end_time
+                        scheduled_ops.add((job, op))
+                        order_idx[machine] += 1
+                        progress = True
+                    if not progress:
+                        raise ValueError("调度过程中没有进展，可能是orders中的操作顺序不合理，导致死锁")
 
-                # 重新计算makespan
+                op_start_times = rebuilt_start_times
                 makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
             # print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
-        #print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
+        # print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
         if makespan < best_makespan or True:
             # Debug: 无脑接受新解，观察搜索过程中的解的变化情况
-            count += 1
+            if makespan < best_makespan:
+                count += 1
             previous_solution = [row[:] for row in best_solution]
             previous_makespan = best_makespan
             focus_window_after = sorted(
@@ -1387,22 +1482,25 @@ if __name__ == "__main__":
 
     from pdrs import solve_instance, PDR, SPT, FDDDivideMWKR
 
-    pdr = PDR(priority=FDDDivideMWKR())
+    pdr = PDR(priority=SPT())
     # Debug for validation
-    import numpy as np
-    test_dataset = np.load("./L2S/validation_data/validation_instance_20x15[1,99].npy", allow_pickle=True)
-    instance = [test_dataset[i] for i in range(test_dataset.shape[0])]
-    jsp_dataset = [{
-    "names": f"validation_instance_20x15_{idx}",
-    "j": 20,
-    "m": 15,
-    "duration": ins[0],
-    "mch": ins[1] - 1,
-    } for idx, ins in enumerate(instance)]
-    dataset = jsp_dataset
+    # import numpy as np
+    # test_dataset = np.load("./L2S/validation_data/validation_instance_20x15[1,99].npy", allow_pickle=True)
+    # instance = [test_dataset[i] for i in range(test_dataset.shape[0])]
+    # jsp_dataset = [{
+    # "names": f"validation_instance_20x15_{idx}",
+    # "j": 20,
+    # "m": 15,
+    # "duration": ins[0],
+    # "mch": ins[1] - 1,
+    # } for idx, ins in enumerate(instance)]
+    # dataset = jsp_dataset
+    # count = 0
+    # start_var = 1
+    # end_var = len(dataset)
     count = 0
     start_var = 1
-    end_var = len(dataset)
+    end_var = 80
     for jsp_dataset in dataset:
         count += 1
         if not (count >= start_var and count <= end_var):
@@ -1414,7 +1512,7 @@ if __name__ == "__main__":
         #     continue
         # if jsp_dataset['names'].startswith("0") or jsp_dataset['names'].startswith("1") or jsp_dataset['names'].startswith("2") or jsp_dataset['names'].startswith("3"):
         #     continue
-        window_size = min(100, jsp_dataset["j"] * jsp_dataset["m"])
+        window_size = min(160, jsp_dataset["j"] * jsp_dataset["m"])
         sols, ms, times = solve_instance(jsp_dataset, pdr=pdr)
         
         op_start_times = convert_solution_to_start_times(sols, jsp_dataset)
@@ -1436,26 +1534,26 @@ if __name__ == "__main__":
                                                                    op_start_times, 
                                                                    use_multi_window=False,
                                                                    window_size=window_size, 
-                                                                   max_iterations=100, 
+                                                                   max_iterations=50, 
                                                                    debug="single_windows",
                                                                    cp_mode=False,
                                                                    plot_improvements=False,
-                                                                   plot_dir=f"gantt_improvements_cp_ta{start_var}")
+                                                                   plot_dir=f"gantt_improvements_cp_ta{start_var}——test")
         # print("调度结果开始时间：")
         # for job, starts in enumerate(op_start_times):
         #     print(f"Job {job}: {starts}")
         # print("Makespan:", ms)
-        # gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
-        # better_gap = (better_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
-        gap = ms 
-        better_gap = better_makespan
-        # print(jsp_dataset["names"], f" Gap: {gap[0]:.2f}", f" Better Gap: {better_gap[0]:.2f}")
-        print(jsp_dataset["names"], f" Gap: {gap:.2f}", f" Better Gap: {better_gap:.2f}")
-        gaps.update(jsp_dataset, gap)
-        better_gaps.update(jsp_dataset, better_gap)
+        gap = (ms - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
+        better_gap = (better_makespan - jsp_dataset["makespan"]) / jsp_dataset["makespan"] * 100
+        # gap = ms 
+        # better_gap = better_makespan
+        print(jsp_dataset["names"], f" Gap: {gap[0]:.2f}", f" Better Gap: {better_gap[0]:.2f}")
+        # print(jsp_dataset["names"], f" Gap: {gap:.2f}", f" Better Gap: {better_gap:.2f}")
+        # gaps.update(jsp_dataset, gap)
+        # better_gaps.update(jsp_dataset, better_gap)
         # break
-        # gaps.update(jsp_dataset, gap[0])
-        # better_gaps.update(jsp_dataset, better_gap[0])
+        gaps.update(jsp_dataset, gap[0])
+        better_gaps.update(jsp_dataset, better_gap[0])
         # plot_gantt(op_start_times, jsp_dataset, title=f"{jsp_dataset['names']}(makespan={better_gap[0]:.2f})")
     print("Overall Gaps:", gaps.avg)
     print(gaps)

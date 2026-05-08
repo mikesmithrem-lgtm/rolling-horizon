@@ -91,84 +91,84 @@ class ObjMeter:
         return sum(self.sum.values()) / sum(self.count.values()) if self.count else 0
 
 
-class Priority:
-    name = "Priority"
-    tau = 0.0001
+# class Priority:
+#     name = "Priority"
+#     tau = 0.0001
 
-    def __init__(self):
-        self._tie = 0.0
+#     def __init__(self):
+#         self._tie = 0.0
 
-    def __call__(self, job, op, costs):
-        raise NotImplementedError()
-
-
-class SPT(Priority):
-    name = "SPT"
-
-    def __call__(self, job, op, costs):
-        self._tie += self.tau
-        return -costs[job][op] - self._tie
+#     def __call__(self, job, op, costs):
+#         raise NotImplementedError()
 
 
-class PDR:
-    def __init__(self, priority, top=3, eps=0.001):
-        self._eps = eps
-        self.priority = priority
-        self.name = priority.name
-        self.top = top
+# class SPT(Priority):
+#     name = "SPT"
 
-    def __call__(self, num_j, num_m, costs, machines, randomized=False):
-        ops = [[0, machines[job][0]] for job in range(num_j)]
-        prio = [self.priority(job, 0, costs) for job in range(num_j)]
+#     def __call__(self, job, op, costs):
+#         self._tie += self.tau
+#         return -costs[job][op] - self._tie
 
-        curr_time = -1
-        mac_time = [0] * num_m
-        sol = [[] for _ in range(num_m)]
-        times = [[] for _ in range(num_j)]
-        active_job = num_j
 
-        while active_job > 0:
-            job_order = sorted(
-                range(num_j),
-                key=lambda job: prio[job],
-                reverse=True,
-            )
-            job_order = [job for job in job_order if prio[job] != -float("inf")]
+# class PDR:
+#     def __init__(self, priority, top=3, eps=0.001):
+#         self._eps = eps
+#         self.priority = priority
+#         self.name = priority.name
+#         self.top = top
 
-            if randomized:
-                rand_order = []
-                top_k = job_order[:self.top]
-                remaining = job_order[self.top:]
-                while top_k:
-                    pick_idx = random.randint(0, len(top_k) - 1)
-                    rand_order.append(top_k.pop(pick_idx))
-                    if remaining:
-                        top_k.append(remaining.pop(0))
-                job_order = rand_order
+#     def __call__(self, num_j, num_m, costs, machines, randomized=False):
+#         ops = [[0, machines[job][0]] for job in range(num_j)]
+#         prio = [self.priority(job, 0, costs) for job in range(num_j)]
 
-            future_times = [ct for ct in mac_time if ct > curr_time]
-            if not future_times:
-                break
-            curr_time = min(future_times)
+#         curr_time = -1
+#         mac_time = [0] * num_m
+#         sol = [[] for _ in range(num_m)]
+#         times = [[] for _ in range(num_j)]
+#         active_job = num_j
 
-            for job in job_order:
-                op, machine = ops[job]
-                min_st = max(mac_time[machine], 0 if op == 0 else times[job][-1])
+#         while active_job > 0:
+#             job_order = sorted(
+#                 range(num_j),
+#                 key=lambda job: prio[job],
+#                 reverse=True,
+#             )
+#             job_order = [job for job in job_order if prio[job] != -float("inf")]
 
-                if min_st - self._eps < curr_time:
-                    if op < num_m - 1:
-                        ops[job][0] = op + 1
-                        ops[job][1] = machines[job][op + 1]
-                        prio[job] = self.priority(job, op + 1, costs)
-                    else:
-                        active_job -= 1
-                        prio[job] = -float("inf")
+#             if randomized:
+#                 rand_order = []
+#                 top_k = job_order[:self.top]
+#                 remaining = job_order[self.top:]
+#                 while top_k:
+#                     pick_idx = random.randint(0, len(top_k) - 1)
+#                     rand_order.append(top_k.pop(pick_idx))
+#                     if remaining:
+#                         top_k.append(remaining.pop(0))
+#                 job_order = rand_order
 
-                    mac_time[machine] = min_st + costs[job][op]
-                    times[job].append(mac_time[machine])
-                    sol[machine].append(job * num_m + op)
+#             future_times = [ct for ct in mac_time if ct > curr_time]
+#             if not future_times:
+#                 break
+#             curr_time = min(future_times)
 
-        return sol, times
+#             for job in job_order:
+#                 op, machine = ops[job]
+#                 min_st = max(mac_time[machine], 0 if op == 0 else times[job][-1])
+
+#                 if min_st - self._eps < curr_time:
+#                     if op < num_m - 1:
+#                         ops[job][0] = op + 1
+#                         ops[job][1] = machines[job][op + 1]
+#                         prio[job] = self.priority(job, op + 1, costs)
+#                     else:
+#                         active_job -= 1
+#                         prio[job] = -float("inf")
+
+#                     mac_time[machine] = min_st + costs[job][op]
+#                     times[job].append(mac_time[machine])
+#                     sol[machine].append(job * num_m + op)
+
+#         return sol, times
 
 
 def solve_instance(ins, pdr, beta=1, seed=1234):
@@ -595,8 +595,8 @@ def tabu_search_n5(
         best_candidate = None
         best_fallback = None
         neighbors = _generate_n5_neighbors(jsp_instance, current_start)
-        if iteration % 500 == 0 or debug:
-            print(f"Tabu Search Iteration {iteration}, current makespan: {current_makespan}, best makespan: {best_makespan}")
+        # if iteration % 500 == 0 or debug:
+        #     print(f"Tabu Search Iteration {iteration}, current makespan: {current_makespan}, best makespan: {best_makespan}")
         for candidate in neighbors:
             if (
                 best_fallback is None
@@ -870,7 +870,8 @@ if __name__ == "__main__":
     random.seed(0)
     st = time()
 
-    pdr = PDR(priority=SPT())
+    from pdrs import solve_instance, PDR, SPT, FDDDivideMWKR
+    pdr = PDR(priority=FDDDivideMWKR())
     count = 0
 
     import numpy as np
@@ -903,8 +904,8 @@ if __name__ == "__main__":
         best_start_times, best_makespan = tabu_search_n5(
             jsp_dataset,
             op_start_times,
-            max_iterations=500,
-            tabu_tenure=10,
+            max_iterations=5000,
+            tabu_tenure=5,
             max_no_improve=None,
             debug=False,
             plot_improvements=False,

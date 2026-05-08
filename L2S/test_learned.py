@@ -13,6 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
+from L2S.dataset import JSPNumpyDataset
 from L2S.env.environment import BatchGraph, JsspWindow
 from L2S.model.actor import Actor
 
@@ -59,7 +60,7 @@ def parse_args():
     parser.add_argument('--data_path', type=str, default=None)
     parser.add_argument('--reference_path', type=str, default=None)
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
-    parser.add_argument('--chunk_size', type=int, default=0)
+    parser.add_argument('--chunk_size', type=int, default=1)
     parser.add_argument('--cap_horizon', type=int, default=None)
     parser.add_argument('--milestones', type=str, default='10,20,50,100')
     parser.add_argument('--result_type', type=str, default='incumbent', choices=['incumbent', 'current'])
@@ -133,12 +134,14 @@ def _resolve_data_path(test_args):
 
 
 def _resolve_reference_path(test_args, data_path):
+    gap_against = np.load('L2S/validation_data/validation_instance_20x15_result.npy')[:, 1]
     if test_args.reference_path is not None:
         reference_path = Path(test_args.reference_path)
         return reference_path if reference_path.is_file() else None
 
-    benchmark_result = data_path.with_name(data_path.stem + '_result.npy')
-    return benchmark_result if benchmark_result.is_file() else None
+    #benchmark_result = data_path.with_name(data_path.stem + '_result.npy')
+    #return benchmark_result if benchmark_result.is_file() else None
+    return gap_against
 
 
 def _parse_milestones(test_args):
@@ -246,23 +249,36 @@ def main():
     if not model_path.is_file():
         raise FileNotFoundError('Model file not found: {}'.format(model_path))
 
-    instances = np.load(data_path)
+    # instances = np.load(data_path)
+    dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
+    print("Testing 100 x 20 instances from dataset...")
+    instances = []
+    reference = []
+    for jsp_dataset in dataset:
+        if jsp_dataset['j'] == 100 and jsp_dataset['m'] == 20:
+            duration = jsp_dataset['duration']
+            mch = jsp_dataset['mch'] + 1
+            instances.append(np.stack([duration, mch], axis=0))
+            reference.append(jsp_dataset['makespan'])
+    instances = np.array(instances)
+    reference = np.array(reference).reshape(-1) if reference else None
     if instances.ndim != 4 or instances.shape[1] != 2:
         raise ValueError('Dataset should have shape [batch, 2, n_job, n_mch], got {}'.format(instances.shape))
-    if instances.shape[2] != test_args.j or instances.shape[3] != test_args.m:
-        raise ValueError(
-            'Dataset size {}x{} does not match args {}x{}.'.format(
-                instances.shape[2], instances.shape[3], test_args.j, test_args.m
-            )
-        )
+    # if instances.shape[2] != test_args.j or instances.shape[3] != test_args.m:
+    #     raise ValueError(
+    #         'Dataset size {}x{} does not match args {}x{}.'.format(
+    #             instances.shape[2], instances.shape[3], test_args.j, test_args.m
+    #         )
+    #     )
 
-    reference = np.load(reference_path).reshape(-1) if reference_path is not None else None
+    # reference = np.load(reference_path).reshape(-1) if reference_path is not None else None
+    # reference = reference_path
     if reference is not None and reference.shape[0] != instances.shape[0]:
         raise ValueError('Reference result count does not match dataset size.')
 
     env = JsspWindow(
-        n_job=test_args.j,
-        n_mch=test_args.m,
+        n_job=100,
+        n_mch=20,
         low=test_args.l,
         high=test_args.h,
         cp_solver_time=test_args.cp_solver_time,
@@ -288,7 +304,7 @@ def main():
     print('Batch :', instances.shape[0], 'instances')
     print('Init  :', test_args.init_type)
     # print('Init  :', 'spt')
-    print('Horizon:', cap_horizon, '| Result:', test_args.result_type)
+    print('Horizon:', cap_horizon * 2, '| Result:', test_args.result_type)
 
     initial_chunks = []
     final_chunks = []
@@ -298,13 +314,14 @@ def main():
 
     for chunk_slice in _chunk_slices(instances.shape[0], chunk_size):
         instance_chunk = instances[chunk_slice]
+        # print('Testing chunk [{}, {}) ...'.format(chunk_slice.start, chunk_slice.stop))
         rollout = rollout_policy(
             policy=policy,
             env=env,
             instances=instance_chunk,
             device=device,
             init_type=test_args.init_type,
-            cap_horizon=cap_horizon,
+            cap_horizon=cap_horizon * 2,
             milestones=milestones,
             result_type=test_args.result_type,
             show=test_args.show,
