@@ -352,6 +352,50 @@ class JsspN5:
         self.eva = Evaluator() if evaluator_type == 'message-passing' else CPM_batch_G
         self.adj_mat_pc = self._adj_mat_pc()
 
+    @staticmethod
+    def _spt_pdr_orders(dur_mat, mch_mat, eps=1e-3, tau=1e-4):
+        """Rebuild per-machine operation orders with the same logic as pdrs.SPT."""
+        n_jobs, n_machines = dur_mat.shape
+        ops = np.array([(0, mch_mat[j, 0] - 1) for j in range(n_jobs)], dtype=np.int64)
+
+        tie = 0.0
+        prio = np.zeros(n_jobs, dtype=np.float64)
+        for job in range(n_jobs):
+            tie += tau
+            prio[job] = -float(dur_mat[job, 0]) - tie
+
+        curr_time = -1
+        machine_ready = [0 for _ in range(n_machines)]
+        orders_by_machine = [[] for _ in range(n_machines)]
+        end_times_by_job = [[] for _ in range(n_jobs)]
+
+        active_job = n_jobs
+        while active_job > 0:
+            job_order = np.argsort(prio)[::-1][:active_job]
+            curr_time = min(ct for ct in machine_ready if ct > curr_time)
+
+            for job in job_order:
+                op_idx, machine = int(ops[job, 0]), int(ops[job, 1])
+                min_st = max(machine_ready[machine], 0 if op_idx == 0 else end_times_by_job[job][-1])
+                if min_st - eps < curr_time:
+                    if op_idx < n_machines - 1:
+                        ops[job, 0] = op_idx + 1
+                        ops[job, 1] = int(mch_mat[job, op_idx + 1] - 1)
+                        tie += tau
+                        prio[job] = -float(dur_mat[job, op_idx + 1]) - tie
+                    else:
+                        active_job -= 1
+                        prio[job] = -float('inf')
+
+                    machine_ready[machine] = int(min_st + dur_mat[job, op_idx])
+                    end_times_by_job[job].append(machine_ready[machine])
+                    orders_by_machine[machine].append(job * n_machines + op_idx)
+
+        op_ids_on_mchs = -n_jobs * np.ones((n_machines, n_jobs), dtype=np.int32)
+        for machine, machine_ops in enumerate(orders_by_machine):
+            op_ids_on_mchs[machine, :len(machine_ops)] = machine_ops
+        return op_ids_on_mchs
+
 
     def _adj_mat_pc(self):
         # Create adjacent matrix for precedence constraints
@@ -521,39 +565,42 @@ class JsspN5:
             mask = np.zeros(shape=n_jobs, dtype=bool)  # initialize the mask: [n_jobs, 1]
             adj_mat_mc = np.zeros(shape=[n_operations, n_operations], dtype=int)  # Create adjacent matrix for machine clique
 
-            gant_chart = -self.high * np.ones_like(dur_mat.transpose(), dtype=np.int32)
-            opIDsOnMchs = -n_jobs * np.ones_like(dur_mat.transpose(), dtype=np.int32)
-            finished_mark = np.zeros_like(mch_mat, dtype=np.int32)
+            if rule_type == 'spt-pdr':
+                opIDsOnMchs = self._spt_pdr_orders(dur_mat, mch_mat)
+            else:    
+                gant_chart = -self.high * np.ones_like(dur_mat.transpose(), dtype=np.int32)
+                opIDsOnMchs = -n_jobs * np.ones_like(dur_mat.transpose(), dtype=np.int32)
+                finished_mark = np.zeros_like(mch_mat, dtype=np.int32)
 
-            actions = []
-            for _ in range(n_operations):
+                actions = []
+                for _ in range(n_operations):
 
-                if rule_type == 'spt':
-                    candidate_masked = candidate_oprs[np.where(~mask)]
-                    dur_candidate = np.take(dur_mat, candidate_masked)
-                    idx = np.random.choice(np.where(dur_candidate == np.min(dur_candidate))[0])
-                    action = candidate_masked[idx]
-                elif rule_type == 'fdd-divide-mwkr':
-                    candidate_masked = candidate_oprs[np.where(~mask)]
-                    fdd = np.take(np.cumsum(dur_mat, axis=1), candidate_masked)
-                    wkr = np.take(np.cumsum(np.multiply(dur_mat, 1 - finished_mark), axis=1), last_col[np.where(~mask)])
-                    priority = fdd / wkr
-                    idx = np.random.choice(np.where(priority == np.min(priority))[0])
-                    action = candidate_masked[idx]
-                else:
-                    action = None
-                actions.append(action)
+                    if rule_type == 'spt':
+                        candidate_masked = candidate_oprs[np.where(~mask)]
+                        dur_candidate = np.take(dur_mat, candidate_masked)
+                        idx = np.random.choice(np.where(dur_candidate == np.min(dur_candidate))[0])
+                        action = candidate_masked[idx]
+                    elif rule_type == 'fdd-divide-mwkr':
+                        candidate_masked = candidate_oprs[np.where(~mask)]
+                        fdd = np.take(np.cumsum(dur_mat, axis=1), candidate_masked)
+                        wkr = np.take(np.cumsum(np.multiply(dur_mat, 1 - finished_mark), axis=1), last_col[np.where(~mask)])
+                        priority = fdd / wkr
+                        idx = np.random.choice(np.where(priority == np.min(priority))[0])
+                        action = candidate_masked[idx]
+                    else:
+                        action = None
+                    actions.append(action)
 
-                permissibleLeftShift(a=action, durMat=dur_mat, mchMat=mch_mat, mchsStartTimes=gant_chart,
-                                     opIDsOnMchs=opIDsOnMchs)
+                    permissibleLeftShift(a=action, durMat=dur_mat, mchMat=mch_mat, mchsStartTimes=gant_chart,
+                                        opIDsOnMchs=opIDsOnMchs)
 
-                # update action space or mask
-                if action not in last_col:
-                    candidate_oprs[action // n_machines] += 1
-                else:
-                    mask[action // n_machines] = 1
-                # update finished_mark:
-                finished_mark[action // n_machines, action % n_machines] = 1
+                    # update action space or mask
+                    if action not in last_col:
+                        candidate_oprs[action // n_machines] += 1
+                    else:
+                        mask[action // n_machines] = 1
+                    # update finished_mark:
+                    finished_mark[action // n_machines, action % n_machines] = 1
 
             for _ in range(opIDsOnMchs.shape[1] - 1):
                 adj_mat_mc[opIDsOnMchs[:, _ + 1], opIDsOnMchs[:, _]] = 1
@@ -711,10 +758,12 @@ class JsspN5:
             (x, edge_indices_pc, edge_indices_mc, batch), current_graphs, sub_graphs_mc, make_span = self._p_list_solver(args=[self.instances, plist, device], plot=plot)
         elif init_type == 'spt':
             (x, edge_indices_pc, edge_indices_mc, batch), current_graphs, sub_graphs_mc, make_span = self._rules_solver(args=[self.instances, device, 'spt'], plot=plot)
+        elif init_type == 'spt-pdr':
+            (x, edge_indices_pc, edge_indices_mc, batch), current_graphs, sub_graphs_mc, make_span = self._rules_solver(args=[self.instances, device, 'spt-pdr'], plot=plot)
         elif init_type == 'fdd-divide-mwkr':
             (x, edge_indices_pc, edge_indices_mc, batch), current_graphs, sub_graphs_mc, make_span = self._rules_solver(args=[self.instances, device, 'fdd-divide-mwkr'], plot=plot)
         else:
-            assert False, 'Initial solution type = "plist", "spt", "fdd-divide-mwkr".'
+            assert False, 'Initial solution type = "plist", "spt", "spt-pdr", "fdd-divide-mwkr".'
 
         self.sub_graphs_mc = sub_graphs_mc
         self.current_graphs = current_graphs
@@ -914,6 +963,50 @@ class JsspWindow:
         nx.draw(G, pos=pos, with_labels=True, arrows=True, connectionstyle='arc3, rad = 0.1')
         plt.show()
 
+    @staticmethod
+    def _spt_pdr_orders(dur_mat, mch_mat, eps=1e-3, tau=1e-4):
+        """Rebuild per-machine operation orders with the same logic as pdrs.SPT."""
+        n_jobs, n_machines = dur_mat.shape
+        ops = np.array([(0, mch_mat[j, 0] - 1) for j in range(n_jobs)], dtype=np.int64)
+
+        tie = 0.0
+        prio = np.zeros(n_jobs, dtype=np.float64)
+        for job in range(n_jobs):
+            tie += tau
+            prio[job] = -float(dur_mat[job, 0]) - tie
+
+        curr_time = -1
+        machine_ready = [0 for _ in range(n_machines)]
+        orders_by_machine = [[] for _ in range(n_machines)]
+        end_times_by_job = [[] for _ in range(n_jobs)]
+
+        active_job = n_jobs
+        while active_job > 0:
+            job_order = np.argsort(prio)[::-1][:active_job]
+            curr_time = min(ct for ct in machine_ready if ct > curr_time)
+
+            for job in job_order:
+                op_idx, machine = int(ops[job, 0]), int(ops[job, 1])
+                min_st = max(machine_ready[machine], 0 if op_idx == 0 else end_times_by_job[job][-1])
+                if min_st - eps < curr_time:
+                    if op_idx < n_machines - 1:
+                        ops[job, 0] = op_idx + 1
+                        ops[job, 1] = int(mch_mat[job, op_idx + 1] - 1)
+                        tie += tau
+                        prio[job] = -float(dur_mat[job, op_idx + 1]) - tie
+                    else:
+                        active_job -= 1
+                        prio[job] = -float('inf')
+
+                    machine_ready[machine] = int(min_st + dur_mat[job, op_idx])
+                    end_times_by_job[job].append(machine_ready[machine])
+                    orders_by_machine[machine].append(job * n_machines + op_idx)
+
+        op_ids_on_mchs = -n_jobs * np.ones((n_machines, n_jobs), dtype=np.int32)
+        for machine, machine_ops in enumerate(orders_by_machine):
+            op_ids_on_mchs[machine, :len(machine_ops)] = machine_ops
+        return op_ids_on_mchs
+
     def _p_list_solver(self, args, plot=False):
         """Build an initial schedule from a priority list."""
         instances, priority_lists, device = args[0], args[1], args[2]
@@ -996,34 +1089,37 @@ class JsspWindow:
             # [n_m, n_j] 
             # gant_chart: equal to op_start_times
             # opIDsOnMchs: equal to orders
-            gant_chart = -self.high * np.ones_like(dur_mat.transpose(), dtype=np.int32)
-            opIDsOnMchs = -self.n_job * np.ones_like(dur_mat.transpose(), dtype=np.int32)
-            finished_mark = np.zeros_like(mch_mat, dtype=np.int32)
+            if rule_type == 'spt-pdr':
+                opIDsOnMchs = self._spt_pdr_orders(dur_mat, mch_mat)
+            else:
+                gant_chart = -self.high * np.ones_like(dur_mat.transpose(), dtype=np.int32)
+                opIDsOnMchs = -self.n_job * np.ones_like(dur_mat.transpose(), dtype=np.int32)
+                finished_mark = np.zeros_like(mch_mat, dtype=np.int32)
 
-            for _ in range(n_operations):
-                if rule_type == 'spt':
-                    # candidate_masked offers idx, and dur_candidate implies the duration.
-                    # shaped [n_job, ]
-                    candidate_masked = candidate_oprs[np.where(~mask)]
-                    dur_candidate = np.take(dur_mat, candidate_masked)
-                    idx = np.random.choice(np.where(dur_candidate == np.min(dur_candidate))[0])
-                    action = candidate_masked[idx]
-                elif rule_type == 'fdd-divide-mwkr':
-                    candidate_masked = candidate_oprs[np.where(~mask)]
-                    fdd = np.take(np.cumsum(dur_mat, axis=1), candidate_masked)
-                    wkr = np.take(np.cumsum(np.multiply(dur_mat, 1 - finished_mark), axis=1), last_col[np.where(~mask)])
-                    priority = fdd / wkr
-                    idx = np.random.choice(np.where(priority == np.min(priority))[0])
-                    action = candidate_masked[idx]
-                else:
-                    action = None
+                for _ in range(n_operations):
+                    if rule_type == 'spt':
+                        # candidate_masked offers idx, and dur_candidate implies the duration.
+                        # shaped [n_job, ]
+                        candidate_masked = candidate_oprs[np.where(~mask)]
+                        dur_candidate = np.take(dur_mat, candidate_masked)
+                        idx = np.random.choice(np.where(dur_candidate == np.min(dur_candidate))[0])
+                        action = candidate_masked[idx]
+                    elif rule_type == 'fdd-divide-mwkr':
+                        candidate_masked = candidate_oprs[np.where(~mask)]
+                        fdd = np.take(np.cumsum(dur_mat, axis=1), candidate_masked)
+                        wkr = np.take(np.cumsum(np.multiply(dur_mat, 1 - finished_mark), axis=1), last_col[np.where(~mask)])
+                        priority = fdd / wkr
+                        idx = np.random.choice(np.where(priority == np.min(priority))[0])
+                        action = candidate_masked[idx]
+                    else:
+                        raise ValueError(f'Unsupported rule type: {rule_type}')
 
-                permissibleLeftShift(a=action, durMat=dur_mat, mchMat=mch_mat, mchsStartTimes=gant_chart, opIDsOnMchs=opIDsOnMchs)
-                if action not in last_col:
-                    candidate_oprs[action // n_machines] += 1
-                else:
-                    mask[action // n_machines] = 1
-                finished_mark[action // n_machines, action % n_machines] = 1
+                    permissibleLeftShift(a=action, durMat=dur_mat, mchMat=mch_mat, mchsStartTimes=gant_chart, opIDsOnMchs=opIDsOnMchs)
+                    if action not in last_col:
+                        candidate_oprs[action // n_machines] += 1
+                    else:
+                        mask[action // n_machines] = 1
+                    finished_mark[action // n_machines, action % n_machines] = 1
 
             for _ in range(opIDsOnMchs.shape[1] - 1):
                 adj_mat_mc[opIDsOnMchs[:, _ + 1], opIDsOnMchs[:, _]] = 1
@@ -1346,7 +1442,7 @@ class JsspWindow:
             )
         else:
             raise ValueError('reward type must be "yaoxin" or "consecutive".')
-        reward = _apply_zero_improvement_penalty(reward, self.zero_improvement_penalty)
+        # reward = _apply_zero_improvement_penalty(reward, self.zero_improvement_penalty)
 
         self.incumbent_objs = torch.where(makespan - self.incumbent_objs < 0, makespan, self.incumbent_objs)
         self.current_objs = makespan
@@ -1382,12 +1478,16 @@ class JsspWindow:
             (x, edge_indices_pc, edge_indices_mc, batch), current_graphs, sub_graphs_mc, make_span = self._rules_solver(
                 args=[self.instances, device, 'spt'], plot=plot
             )
+        elif init_type == 'spt-pdr':
+            (x, edge_indices_pc, edge_indices_mc, batch), current_graphs, sub_graphs_mc, make_span = self._rules_solver(
+                args=[self.instances, device, 'spt-pdr'], plot=plot
+            )
         elif init_type == 'fdd-divide-mwkr':
             (x, edge_indices_pc, edge_indices_mc, batch), current_graphs, sub_graphs_mc, make_span = self._rules_solver(
                 args=[self.instances, device, 'fdd-divide-mwkr'], plot=plot
             )
         else:
-            raise AssertionError('Initial solution type = "plist", "spt", "fdd-divide-mwkr".')
+            raise AssertionError('Initial solution type = "plist", "spt", "spt-pdr", "fdd-divide-mwkr".')
 
         self.sub_graphs_mc = sub_graphs_mc
         self.current_graphs = current_graphs

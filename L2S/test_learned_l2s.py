@@ -3,6 +3,7 @@ import os
 import torch
 import time
 import random
+from dataset import JSPNumpyDataset
 from env.environment import JsspN5, BatchGraph
 from model.actor import Actor
 
@@ -168,19 +169,27 @@ def main():
         elif test_t == 'ft':
             problem_j, problem_m = ft_problem_j, ft_problem_m
         elif test_t == 'validation_instance_':
-            problem_j, problem_m = [20], [15]
+            problem_j, problem_m = [100], [20]
         else:
             raise Exception(
                 'Problem type must be in testing_type = ["tai", "abz", "orb", "yn", "swv", "la", "ft", "syn"].')
 
         for p_j, p_m in zip(problem_j, problem_m):  # select problem size
 
-            inst = np.load('L2S/validation_data/validation_instance_20x15[1,99].npy')
+            # inst = np.load('L2S/validation_data/validation_instance_20x15[1,99].npy')
+            dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
+            inst = []
+            idx = 70
+            duration = dataset[idx]['duration']
+            mch_one_based = dataset[idx]['mch'] + 1
+            inst.append(np.stack([duration, mch_one_based], axis=0))
+            inst = np.stack(inst, axis=0)
             print('\nStart testing {}{}x{}...'.format(test_t, p_j, p_m))
 
             # read saved gap_against or use ortools to solve it.
             if test_t != 'syn' and test_t != 'validation_instance_':
-                gap_against = np.load('L2S/validation_data/{}{}x{}_result.npy'.format(test_t, p_j, p_m))
+                # gap_against = np.load('L2S/validation_data/{}{}x{}_result.npy'.format(test_t, p_j, p_m))
+                gap_against = [dataset[idx]['makespan']]
             else:
                 # ortools solver
                 from pathlib import Path

@@ -9,7 +9,7 @@ import random
 import multiprocessing
 from collections import defaultdict
 from time import time
-
+SEED = 0
 
 def priority_dispatch_rule(jsp_instance, rule="spt"):
     """
@@ -128,7 +128,7 @@ def solve_window_with_machine_avail(jsp_instance,
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 0.1
     solver.parameters.num_search_workers = 1
-    solver.parameters.random_seed = 0
+    solver.parameters.random_seed = SEED
     status = solver.Solve(model)
     # ed = time()
     # print("This CP use {:.2f} seconds".format(ed - st))
@@ -368,7 +368,9 @@ def large_neiborhood_search(
     debug="all_windows", 
     cp_mode=False,
     plot_improvements=False,
-    plot_dir="gantt_improvements"):
+    plot_dir="gantt_improvements",
+    return_history=False, 
+    step_action=None):
 
     j, m = jsp_instance["j"], jsp_instance["m"]
     nopr = j * m
@@ -381,19 +383,34 @@ def large_neiborhood_search(
 
     best_solution = [row[:] for row in est]
     best_makespan = max(est[job][m-1] + duration[job][m-1] for job in range(j))
+    makespan_update_iterations = [0]
+    makespan_update_values = [best_makespan]
+    all_iterations = [0]
+    all_best_makespans = [best_makespan]
+    last_decrease_iteration = 0
     improvement_count = 0
     process_frame_paths = []
     instance_name = os.path.splitext(
         os.path.basename(jsp_instance.get("names", "instance"))
     )[0]
     if nopr <= window_size:
+        if return_history:
+            history = {
+                "update_iterations": makespan_update_iterations,
+                "update_makespans": makespan_update_values,
+                "all_iterations": all_iterations,
+                "all_best_makespans": all_best_makespans,
+                "last_decrease_iteration": last_decrease_iteration,
+                "best_iteration": makespan_update_iterations[-1],
+            }
+            return best_solution, best_makespan, history
         return best_solution, best_makespan
     
     count = 0
     it = 0
     roll_count = 0
     find_better_in_this_iteration = True
-    while it <= max_iterations:
+    while it < max_iterations:
         # if (best_makespan - jsp_instance["makespan"][0]) / jsp_instance["makespan"][0] * 100 <= 1:
         #     break
         op_start_times = [row[:] for row in best_solution]
@@ -447,18 +464,22 @@ def large_neiborhood_search(
             return list(reversed(path))
         if not end_ops:
             critical_ops = []
-        else:
+        else: 
             start_op = random.choice(end_ops)
             critical_ops = trace_critical_path(start_op)
 
         # print(len(critical_ops), " critical operations in iteration ", it) 1746
         # Debug
-        critical_ops = [(job, op) for job in range(j) for op in range(m)]
+        # critical_ops = [(job, op) for job in range(j) for op in range(m)]
         if len(critical_ops) == 0:
             window_idx = random.randint(0, nopr - window_size)
             raise AssertionError("没有找到关键路径上的操作，可能是计算lst时出现了问题")
         else:
             crit_op = random.choice(critical_ops)
+            if step_action is not None:
+                assert len(step_action) == max_iterations, f"step_action长度 {len(step_action)} 不等于 max_iterations {max_iterations}"
+                crit_op_id = step_action[it]
+                crit_op = (crit_op_id // m, crit_op_id % m)
             window_idx = sorted_ops.index(crit_op)
             # 保证窗口不会越界
             if window_idx > nopr - window_size:
@@ -518,6 +539,23 @@ def large_neiborhood_search(
             for (job, op), st in window_result.items():
                 op_start_times[job][op] = st
             makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
+            if makespan < best_makespan:
+                makespan_update_iterations.append(it)
+                makespan_update_values.append(makespan)
+                best_makespan = makespan
+                last_decrease_iteration = it
+            all_iterations.append(it)
+            all_best_makespans.append(best_makespan)
+            if return_history:
+                history = {
+                    "update_iterations": makespan_update_iterations,
+                    "update_makespans": makespan_update_values,
+                    "all_iterations": all_iterations,
+                    "all_best_makespans": all_best_makespans,
+                    "last_decrease_iteration": last_decrease_iteration,
+                    "best_iteration": makespan_update_iterations[-1],
+                }
+                return op_start_times, makespan, history
             return op_start_times, makespan
             
 
@@ -945,6 +983,8 @@ def large_neiborhood_search(
                 # ed = time()
                 # print(f"Window {window_idx} solved in {ed - st:.2f} seconds")
                 if not window_result:
+                    all_iterations.append(it)
+                    all_best_makespans.append(best_makespan)
                     continue  # 优化失败，跳过
 
                 ref_start_times = [row[:] for row in op_start_times]
@@ -1019,6 +1059,9 @@ def large_neiborhood_search(
             # Debug: 无脑接受新解，观察搜索过程中的解的变化情况
             if makespan < best_makespan:
                 count += 1
+                makespan_update_iterations.append(it)
+                makespan_update_values.append(makespan)
+                last_decrease_iteration = it
             previous_solution = [row[:] for row in best_solution]
             previous_makespan = best_makespan
             focus_window_after = sorted(
@@ -1031,7 +1074,6 @@ def large_neiborhood_search(
             )
             best_solution = [row[:] for row in op_start_times]
             best_makespan = makespan
-            improvement_count += 1
             if plot_improvements:
                 file_stem = (
                     f"{instance_name}_improve_{improvement_count:03d}_"
@@ -1095,6 +1137,9 @@ def large_neiborhood_search(
         else:
             find_better_in_this_iteration = False
 
+        all_iterations.append(it)
+        all_best_makespans.append(best_makespan)
+
     if plot_improvements and process_frame_paths:
         save_gantt_search_process_gif(
             process_frame_paths,
@@ -1102,7 +1147,17 @@ def large_neiborhood_search(
         )
 
     print(f"LNS finished after {max_iterations} iterations, improved {count} times, best makespan: {best_makespan}")
-    return best_solution, best_makespan
+    if return_history:
+        history = {
+            "update_iterations": makespan_update_iterations,
+            "update_makespans": makespan_update_values,
+            "all_iterations": all_iterations,
+            "all_best_makespans": all_best_makespans,
+            "last_decrease_iteration": last_decrease_iteration,
+            "best_iteration": makespan_update_iterations[-1],
+        }
+        return best_solution, best_makespan, history
+    return best_solution, best_makespan, None
 
 
 def convert_solution_to_start_times(sol, jsp_instance):
@@ -1468,6 +1523,91 @@ def save_gantt_search_process_gif(frame_paths, gif_path, frame_duration=700):
     )
 
 
+def _to_scalar_makespan(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, np.ndarray)):
+        arr = np.asarray(value).reshape(-1)
+        if arr.size == 0:
+            return None
+        return float(arr[0])
+    return float(value)
+
+
+def plot_makespan_update_curve(
+    instance_name,
+    all_iterations,
+    all_best_makespans,
+    best_known_makespan=None,
+    last_decrease_iteration=None,
+    save_path=None,
+):
+    if not all_iterations or not all_best_makespans:
+        return None
+
+    best_known = _to_scalar_makespan(best_known_makespan)
+    x = np.asarray(all_iterations, dtype=float)
+    y = np.asarray(all_best_makespans, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.plot(x, y, color="tab:blue", linewidth=1.8, label="Best-so-far makespan (every iteration)")
+
+    if best_known is not None:
+        ax.axhline(
+            y=best_known,
+            color="tab:orange",
+            linestyle="--",
+            linewidth=2.0,
+            label=f"Gold standard={best_known:.2f}",
+        )
+
+    if last_decrease_iteration is None:
+        diffs = np.diff(y)
+        decrease_idxs = np.where(diffs < 0)[0]
+        if decrease_idxs.size > 0:
+            last_decrease_iteration = int(x[decrease_idxs[-1] + 1])
+        else:
+            last_decrease_iteration = 0
+
+    last_idx = int(np.where(x == float(last_decrease_iteration))[0][-1]) if np.any(x == float(last_decrease_iteration)) else int(np.argmin(y))
+    best_iter = int(x[last_idx])
+    best_value = float(y[last_idx])
+    ax.scatter([best_iter], [best_value], color="crimson", s=70, zorder=4)
+    ax.axvline(best_iter, color="crimson", linestyle=":", linewidth=1.5, alpha=0.9)
+    ax.annotate(
+        f"last decrease at iter {best_iter}\nfinal best={best_value:.2f}",
+        xy=(best_iter, best_value),
+        xytext=(14, -28),
+        textcoords="offset points",
+        fontsize=10,
+        color="crimson",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.9},
+        arrowprops={"arrowstyle": "->", "color": "crimson", "lw": 1.1},
+    )
+
+    ax.set_title(f"{instance_name} makespan update curve")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Makespan")
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend()
+    plt.tight_layout()
+
+    if save_path is None:
+        safe_name = "".join(
+            ch if ch.isalnum() or ch in "._-()[]{}=+" else "_"
+            for ch in str(instance_name)
+        )
+        save_path = f"{safe_name}_makespan_curve.png"
+
+    save_dir = os.path.dirname(save_path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+    return save_path
+
+
 if __name__ == "__main__":
     import os
     allowed = set(range(1, os.cpu_count()))
@@ -1477,7 +1617,8 @@ if __name__ == "__main__":
     dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
     gaps = ObjMeter()
     better_gaps = ObjMeter()
-    random.seed(0)
+    random.seed(SEED)
+    np.random.seed(SEED)
     st = time()
 
     from pdrs import solve_instance, PDR, SPT, FDDDivideMWKR
@@ -1499,8 +1640,8 @@ if __name__ == "__main__":
     # start_var = 1
     # end_var = len(dataset)
     count = 0
-    start_var = 1
-    end_var = 80
+    start_var = 72
+    end_var = 72
     for jsp_dataset in dataset:
         count += 1
         if not (count >= start_var and count <= end_var):
@@ -1512,7 +1653,7 @@ if __name__ == "__main__":
         #     continue
         # if jsp_dataset['names'].startswith("0") or jsp_dataset['names'].startswith("1") or jsp_dataset['names'].startswith("2") or jsp_dataset['names'].startswith("3"):
         #     continue
-        window_size = min(160, jsp_dataset["j"] * jsp_dataset["m"])
+        window_size = min(120, jsp_dataset["j"] * jsp_dataset["m"])
         sols, ms, times = solve_instance(jsp_dataset, pdr=pdr)
         
         op_start_times = convert_solution_to_start_times(sols, jsp_dataset)
@@ -1528,17 +1669,51 @@ if __name__ == "__main__":
         
         # op_start_times, ms = rolling_horizon_cp(jsp_dataset, window_size=window_size, roll_speed=10)
 
-        # print(f"Initial solution for {jsp_dataset['names']} has makespan {ms} with window size {window_size}, best known makespan {jsp_dataset['makespan']}")
-        print(f"Initial solution for {jsp_dataset['names']} has makespan {ms} with window size {window_size}, no best known makespan")
-        better_solution, better_makespan = large_neiborhood_search(jsp_dataset, 
-                                                                   op_start_times, 
-                                                                   use_multi_window=False,
-                                                                   window_size=window_size, 
-                                                                   max_iterations=50, 
-                                                                   debug="single_windows",
-                                                                   cp_mode=False,
-                                                                   plot_improvements=False,
-                                                                   plot_dir=f"gantt_improvements_cp_ta{start_var}——test")
+        best_known = _to_scalar_makespan(jsp_dataset.get("makespan"))
+        restore_history = False
+        if best_known is not None:
+            print(
+                f"Initial solution for {jsp_dataset['names']} has makespan {ms} "
+                f"with window size {window_size}, best known makespan {best_known:.2f}"
+            )
+        else:
+            print(
+                f"Initial solution for {jsp_dataset['names']} has makespan {ms} "
+                f"with window size {window_size}, no best known makespan"
+            )
+        # step_action = list(np.load('L2S/test_learned_step_actions.npy', allow_pickle=True) - 1)
+        step_action = None
+        better_solution, better_makespan, search_history = large_neiborhood_search(jsp_dataset, 
+                                                                                    op_start_times, 
+                                                                                    use_multi_window=False,
+                                                                                    window_size=window_size, 
+                                                                                    max_iterations=200, 
+                                                                                    debug="single_windows",
+                                                                                    cp_mode=False,
+                                                                                    plot_improvements=False,
+                                                                                    plot_dir=f"gantt_improvements_cp_ta{start_var}——test",
+                                                                                    return_history=restore_history, 
+                                                                                    step_action=step_action)
+        if restore_history and search_history is not None:
+            curve_output_dir = "gantt_improvements_ts_ms"
+            curve_path = os.path.join(
+                curve_output_dir,
+                f"seed_{SEED}_",
+                f"{jsp_dataset['names']}_makespan_curve.png",
+            )
+            saved_curve_path = plot_makespan_update_curve(
+                jsp_dataset["names"],
+                search_history["all_iterations"],
+                search_history["all_best_makespans"],
+                best_known_makespan=jsp_dataset.get("makespan"),
+                last_decrease_iteration=search_history["last_decrease_iteration"],
+                save_path=curve_path,
+            )
+            if saved_curve_path is not None:
+                print(
+                    f"Saved makespan curve for {jsp_dataset['names']} to {saved_curve_path}; "
+                    f"last decrease appears at iteration {search_history['last_decrease_iteration']}"
+                )
         # print("调度结果开始时间：")
         # for job, starts in enumerate(op_start_times):
         #     print(f"Job {job}: {starts}")

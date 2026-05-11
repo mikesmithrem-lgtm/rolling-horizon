@@ -45,12 +45,12 @@ def parse_args():
 
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--steps_learn', type=int, default=10)
-    parser.add_argument('--transit', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--episodes', type=int, default=128000)
+    parser.add_argument('--transit', type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--episodes', type=int, default=6400)
     parser.add_argument('--step_validation', type=int, default=10)
 
-    parser.add_argument('--window_size', type=int, default=100)
+    parser.add_argument('--window_size', type=int, default=120)
     parser.add_argument('--cp_solver_time', type=float, default=1)
     parser.add_argument('--cp_solver_cpu', type=int, default=1)
     parser.add_argument('--cp_solver_budget', type=int, default=16)
@@ -60,9 +60,9 @@ def parse_args():
     parser.add_argument('--data_path', type=str, default=None)
     parser.add_argument('--reference_path', type=str, default=None)
     parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'])
-    parser.add_argument('--chunk_size', type=int, default=1)
+    parser.add_argument('--chunk_size', type=int, default=16)
     parser.add_argument('--cap_horizon', type=int, default=None)
-    parser.add_argument('--milestones', type=str, default='10,20,50,100')
+    parser.add_argument('--milestones', type=str, default='10,20,50,100,200')
     parser.add_argument('--result_type', type=str, default='incumbent', choices=['incumbent', 'current'])
     parser.add_argument('--seed', type=int, default=12345)
     parser.add_argument('--show', action='store_true')
@@ -206,11 +206,15 @@ def rollout_policy(policy, env, instances, device, init_type, cap_horizon, miles
     initial_result = _metric_from_env(env, result_type)
 
     step_results = {}
+    step_actions = []
     start_time = time.time()
     while env.itr < cap_horizon:
         batch_data.wrapper(*states)
         with torch.no_grad():
             actions, _ = policy(batch_data, feasible_actions)
+            # print('Step {}: action {}'.format(env.itr, actions))
+            # Debug: record step_actions
+            step_actions.append(actions[0][0])
         states, _, feasible_actions, _ = env.step(actions, device, plot=show)
         if env.itr in milestones:
             step_results[env.itr] = (
@@ -226,6 +230,7 @@ def rollout_policy(policy, env, instances, device, init_type, cap_horizon, miles
         'final': final_result,
         'incumbent': incumbent_result,
         'milestones': step_results,
+        'actions': step_actions,
     }
 
 
@@ -251,15 +256,21 @@ def main():
 
     # instances = np.load(data_path)
     dataset = JSPNumpyDataset(data_dir="./benchmark/TA")
-    print("Testing 100 x 20 instances from dataset...")
+    idx = 71
+    print(f"Testing 100 x 20 instances {idx + 1} from dataset...")
     instances = []
     reference = []
-    for jsp_dataset in dataset:
-        if jsp_dataset['j'] == 100 and jsp_dataset['m'] == 20:
-            duration = jsp_dataset['duration']
-            mch = jsp_dataset['mch'] + 1
-            instances.append(np.stack([duration, mch], axis=0))
-            reference.append(jsp_dataset['makespan'])
+    duration = dataset[idx]['duration']
+    mch_one_based = dataset[idx]['mch'] + 1
+    instances.append(np.stack([duration, mch_one_based], axis=0))
+    reference.append(dataset[idx]['makespan'])
+    # for jsp_dataset in dataset:
+    #     if jsp_dataset['j'] == 100 and jsp_dataset['m'] == 20:
+    #         duration = jsp_dataset['duration']
+    #         mch = jsp_dataset['mch'] + 1
+    #         instances.append(np.stack([duration, mch], axis=0))
+    #         reference.append(jsp_dataset['makespan'])
+    #         break
     instances = np.array(instances)
     reference = np.array(reference).reshape(-1) if reference else None
     if instances.ndim != 4 or instances.shape[1] != 2:
@@ -302,13 +313,14 @@ def main():
     print('Model :', model_path)
     print('Data  :', data_path)
     print('Batch :', instances.shape[0], 'instances')
-    print('Init  :', test_args.init_type)
-    # print('Init  :', 'spt')
-    print('Horizon:', cap_horizon * 2, '| Result:', test_args.result_type)
+    # print('Init  :', test_args.init_type)
+    print('Init  :', 'spt-pdr')
+    print('Horizon:', cap_horizon, '| Result:', test_args.result_type)
 
     initial_chunks = []
     final_chunks = []
     incumbent_chunks = []
+    step_actions = []
     milestone_results = {step: [] for step in milestones}
     milestone_times = {step: [] for step in milestones}
 
@@ -320,8 +332,8 @@ def main():
             env=env,
             instances=instance_chunk,
             device=device,
-            init_type=test_args.init_type,
-            cap_horizon=cap_horizon * 2,
+            init_type='spt-pdr', # test_args.init_type,
+            cap_horizon=cap_horizon,
             milestones=milestones,
             result_type=test_args.result_type,
             show=test_args.show,
@@ -329,6 +341,7 @@ def main():
         initial_chunks.append(rollout['initial'])
         final_chunks.append(rollout['final'])
         incumbent_chunks.append(rollout['incumbent'])
+        step_actions.extend(rollout['actions'])
         for step in milestones:
             if step in rollout['milestones']:
                 step_result, step_time = rollout['milestones'][step]
@@ -338,6 +351,10 @@ def main():
     initial_result = np.concatenate(initial_chunks, axis=0)
     final_result = np.concatenate(final_chunks, axis=0)
     incumbent_result = np.concatenate(incumbent_chunks, axis=0)
+    # Debug: record
+    saved_step_actions_path = L2S_DIR / 'test_learned_step_actions.npy'
+    np.save(saved_step_actions_path, np.array(step_actions))
+    print('Step actions saved to {}'.format(saved_step_actions_path))
 
     print('Initial mean makespan   : {:.2f}'.format(float(initial_result.mean())))
     print('Final mean makespan     : {:.2f}'.format(float(final_result.mean())))

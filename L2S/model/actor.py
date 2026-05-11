@@ -174,12 +174,12 @@ class Actor(nn.Module):
                                                   Linear(hidden_dim, hidden_dim)))
 
         # Debug: If l2s_test is False, Activate it
-        self.machine_window_encoder = Sequential(Linear(4, hidden_dim),
-                                                 torch.nn.Tanh(),
-                                                 Linear(hidden_dim, hidden_dim))
-        self.machine_window_policy = Sequential(Linear(hidden_dim * 3, hidden_dim),
-                                                torch.nn.Tanh(),
-                                                Linear(hidden_dim, 1))
+        # self.machine_window_encoder = Sequential(Linear(4, hidden_dim),
+        #                                          torch.nn.Tanh(),
+        #                                          Linear(hidden_dim, hidden_dim))
+        # self.machine_window_policy = Sequential(Linear(hidden_dim * 3, hidden_dim),
+        #                                         torch.nn.Tanh(),
+        #                                         Linear(hidden_dim, 1))
 
     def _machine_window_bonus(self, node_embed_augmented, feasible_actions, action_machine_avail):
         """Score feasible actions with the rolling-window machine availability branch."""
@@ -216,7 +216,7 @@ class Actor(nn.Module):
 
         return action_bonus
 
-    def forward(self, batch_states, feasible_actions, l2s_test=False):
+    def forward(self, batch_states, feasible_actions, l2s_test=True):
 
         if self.embedding_type == 'gin':
             node_embed, graph_embed = self.embedding(batch_states.x,
