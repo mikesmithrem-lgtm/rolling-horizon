@@ -24,10 +24,6 @@ def _bind_main_process_away_from_cpu0():
     return set(os.sched_getaffinity(0))
 
 
-def _reward_tag():
-    return '{}_zip{:g}'.format(args.reward_type, args.zero_improvement_penalty)
-
-
 class RL2SCPJSSP:
     def __init__(self):
         self.window_size = getattr(args, 'window_size', args.j * args.m)
@@ -47,8 +43,6 @@ class RL2SCPJSSP:
             cp_solver_cpu=self.cp_solver_cpu,
             cpu_budget=self.cpu_budget,
             window_size=self.window_size,
-            log_path=self.training_env_log_path,
-            reward_type=args.reward_type,
             zero_improvement_penalty=args.zero_improvement_penalty,
         )
         self.env_validation = JsspWindow(
@@ -60,8 +54,6 @@ class RL2SCPJSSP:
             cp_solver_cpu=self.cp_solver_cpu,
             cpu_budget=self.cpu_budget,
             window_size=self.window_size,
-            log_path=self.validation_env_log_path,
-            reward_type=args.reward_type,
             zero_improvement_penalty=args.zero_improvement_penalty,
         )
         self.eps = np.finfo(np.float32).eps.item()
@@ -114,10 +106,10 @@ class RL2SCPJSSP:
 
     def _tb_run_name(self):
         return ('rl2scp_'
-                '{}x{}[{},{}]_{}_{}_{}_{}_'
+                '{}x{}[{},{}]_{}_{}_{}_'
                 '{}_{}_{}_{}_{}_'
                 '{}_{}_{}_{}_{}_{}'
-                .format(args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
+                .format(args.j, args.m, args.l, args.h, args.init_type,args.gamma, self._cp_run_tag(),
                         args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
                         args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation))
 
@@ -166,11 +158,11 @@ class RL2SCPJSSP:
             print('Find better CP-window model w.r.t incumbent objs, saving model...')
             torch.save(policy.state_dict(),
                        './L2S/saved_model/incumbent-cp_'
-                       '{}x{}[{},{}]_{}_{}_{}_{}_'
+                       '{}x{}[{},{}]_{}_{}_{}_'
                        '{}_{}_{}_{}_{}_'
                        '{}_{}_{}_{}_{}_{}'
                        '.pth'
-                        .format(args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
+                        .format(args.j, args.m, args.l, args.h, args.init_type, args.gamma, self._cp_run_tag(),
                                 args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
                                 args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation))
             self.incumbent_validation_result = validation_result1
@@ -178,11 +170,11 @@ class RL2SCPJSSP:
             print('Find better CP-window model w.r.t final step objs, saving model...')
             torch.save(policy.state_dict(),
                        './L2S/saved_model/last-step-cp_'
-                       '{}x{}[{},{}]_{}_{}_{}_{}_'
+                       '{}x{}[{},{}]_{}_{}_{}_'
                        '{}_{}_{}_{}_{}_'
                        '{}_{}_{}_{}_{}_{}'
                        '.pth'
-                        .format(args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
+                        .format(args.j, args.m, args.l, args.h, args.init_type, args.gamma, self._cp_run_tag(),
                                 args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type, self.dghan_param_for_saved_model,
                                 args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes, args.step_validation))
             self.current_validation_result = validation_result2
@@ -238,15 +230,6 @@ class RL2SCPJSSP:
                 reward_log.append(reward_mean)
                 writer.add_scalar('train/reward_step', reward_mean, train_step)
                 writer.add_scalar('train/current_obj_step', self.env_training.current_objs.mean().cpu().item(), train_step)
-                writer.add_scalar('train/incumbent_obj_step', self.env_training.incumbent_objs.mean().cpu().item(), train_step)
-                # print(
-                #     'Batch {:4d} | Step {:4d} | time {:.2f}s | reward {:.4f}'.format(
-                #         batch_i,
-                #         train_step,
-                #         e_inner - t_inner,
-                #         reward_mean,
-                #     )
-                # )
                 train_step += 1
                 rewards_buffer.append(rewards)
                 log_probs_buffer.append(log_ps)
@@ -280,7 +263,6 @@ class RL2SCPJSSP:
             )
             log.append(self.env_training.current_objs.mean().cpu().item())
             writer.add_scalar('train/final_obj_batch', self.env_training.current_objs.mean().cpu().item(), batch_i)
-            writer.add_scalar('train/incumbent_obj_batch', self.env_training.incumbent_objs.mean().cpu().item(), batch_i)
             if reward_log:
                 writer.add_scalar('train/reward_batch_mean', float(np.mean(reward_log)), batch_i)
 
@@ -291,20 +273,20 @@ class RL2SCPJSSP:
                 writer.add_scalar('validation/final_obj', validation_result2, batch_i)
 
                 np.save('./log/training_log_cp_'
-                        '{}x{}[{},{}]_{}_{}_{}_{}_'
+                        '{}x{}[{},{}]_{}_{}_{}_'
                         '{}_{}_{}_{}_{}_'
                         '{}_{}_{}_{}_{}_{}.npy'
-                        .format(args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
+                        .format(args.j, args.m, args.l, args.h, args.init_type, args.gamma, self._cp_run_tag(),
                                 args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type,
                                 self.dghan_param_for_saved_model,
                                 args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes,
                                 args.step_validation),
                         np.array(log))
                 np.save('./log/validation_log_cp_'
-                        '{}x{}[{},{}]_{}_{}_{}_{}_'
+                        '{}x{}[{},{}]_{}_{}_{}_'
                         '{}_{}_{}_{}_{}_'
                         '{}_{}_{}_{}_{}_{}.npy'
-                        .format(args.j, args.m, args.l, args.h, args.init_type, _reward_tag(), args.gamma, self._cp_run_tag(),
+                        .format(args.j, args.m, args.l, args.h, args.init_type, args.gamma, self._cp_run_tag(),
                                 args.hidden_dim, args.embedding_layer, args.policy_layer, args.embedding_type,
                                 self.dghan_param_for_saved_model,
                                 args.lr, args.steps_learn, args.transit, args.batch_size, args.episodes,
@@ -313,7 +295,6 @@ class RL2SCPJSSP:
         writer.close()
 
 if __name__ == '__main__':
-    # agent = RL2S4JSSP()
     affinity = _bind_main_process_away_from_cpu0()
     if affinity is not None:
         print("CPU affinity:", affinity)

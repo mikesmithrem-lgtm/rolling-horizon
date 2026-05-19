@@ -6,8 +6,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import numpy as np
 import torch.nn.functional as F
-from torch.distributions.categorical import Categorical
 import torch.nn as nn
+from torch.distributions.categorical import Categorical
 from torch.nn import Sequential, Linear, ReLU
 from torch_geometric.nn import GINConv, GATConv, global_mean_pool
 from torch_geometric.utils import add_self_loops
@@ -33,28 +33,20 @@ class DGHAN(torch.nn.Module):
         self.layer_dghan = layer_dghan
         self.hidden_dim = hidden_dim
 
-        ## DGHAN conv layers
         self.DGHAN_layers = torch.nn.ModuleList()
 
-        # init DGHAN layer
         if layer_dghan == 1:
-            # only DGHAN layer
             self.DGHAN_layers.append(DGHANlayer(in_dim, hidden_dim, dropout, concat=False, heads=heads))
         else:
-            # first DGHAN layer
             self.DGHAN_layers.append(DGHANlayer(in_dim, hidden_dim, dropout, concat=True, heads=heads))
-            # following DGHAN layers
-            for layer in range(layer_dghan - 2):
+            for _ in range(layer_dghan - 2):
                 self.DGHAN_layers.append(DGHANlayer(heads * hidden_dim, hidden_dim, dropout, concat=True, heads=heads))
-            # last DGHAN layer
             self.DGHAN_layers.append(DGHANlayer(heads * hidden_dim, hidden_dim, dropout, concat=False, heads=1))
 
     def forward(self, x, edge_index_pc, edge_index_mc, batch_size):
-
-        # initial layer forward
-        h_node = self.DGHAN_layers[0](x, edge_index_pc, edge_index_mc)
+        h_node = self.DGHAN_layers[0](x,edge_index_pc,edge_index_mc)
         for layer in range(1, self.layer_dghan):
-            h_node = self.DGHAN_layers[layer](h_node, edge_index_pc, edge_index_mc)
+            h_node = self.DGHAN_layers[layer](h_node,edge_index_pc,edge_index_mc)
 
         return h_node, torch.mean(h_node.reshape(batch_size, -1, self.hidden_dim), dim=1)
 
@@ -64,53 +56,54 @@ class GIN(torch.nn.Module):
         super(GIN, self).__init__()
         self.layer_gin = layer_gin
 
-        ## GIN conv layers
         self.GIN_layers = torch.nn.ModuleList()
 
-        # init gin layer
         self.GIN_layers.append(
             GINConv(
-                Sequential(Linear(in_dim, hidden_dim),
-                           torch.nn.BatchNorm1d(hidden_dim),
-                           ReLU(),
-                           Linear(hidden_dim, hidden_dim)),
+                Sequential(
+                    Linear(in_dim, hidden_dim),
+                    torch.nn.BatchNorm1d(hidden_dim),
+                    ReLU(),
+                    Linear(hidden_dim, hidden_dim)
+                ),
                 eps=0,
                 train_eps=False,
                 aggr='mean',
-                flow="source_to_target")
+                flow="source_to_target"
+            )
         )
 
-        # rest gin layers
-        for layer in range(layer_gin - 1):
+        for _ in range(layer_gin - 1):
             self.GIN_layers.append(
                 GINConv(
-                    Sequential(Linear(hidden_dim, hidden_dim),
-                               torch.nn.BatchNorm1d(hidden_dim),
-                               ReLU(),
-                               Linear(hidden_dim, hidden_dim)),
+                    Sequential(
+                        Linear(hidden_dim, hidden_dim),
+                        torch.nn.BatchNorm1d(hidden_dim),
+                        ReLU(),
+                        Linear(hidden_dim, hidden_dim)
+                    ),
                     eps=0,
                     train_eps=False,
                     aggr='mean',
-                    flow="source_to_target")
+                    flow="source_to_target"
+                )
             )
 
     def forward(self, x, edge_index, batch):
-
         hidden_rep = []
         node_pool_over_layer = 0
-        # initial layer forward
-        h = self.GIN_layers[0](x, edge_index)
+
+        h = self.GIN_layers[0](x,edge_index)
         node_pool_over_layer += h
         hidden_rep.append(h)
-        # rest layers forward
+
         for layer in range(1, self.layer_gin):
-            h = self.GIN_layers[layer](h, edge_index)
+            h = self.GIN_layers[layer](h,edge_index)
             node_pool_over_layer += h
             hidden_rep.append(h)
 
-        # Graph pool
         gPool_over_layer = 0
-        for layer, layer_h in enumerate(hidden_rep):
+        for layer_h in hidden_rep:
             g_pool = global_mean_pool(layer_h, batch)
             gPool_over_layer += g_pool
 
@@ -131,114 +124,164 @@ class Actor(nn.Module):
         self.policy_l = policy_l
         self.embedding_type = embedding_type
         self.hidden_dim = hidden_dim
+
         if self.embedding_type == 'gin':
             self.embedding = GIN(in_dim=in_dim, hidden_dim=hidden_dim, layer_gin=embedding_l)
+            base_embed_dim = hidden_dim
         elif self.embedding_type == 'dghan':
             self.embedding = DGHAN(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout, layer_dghan=embedding_l, heads=heads)
+            base_embed_dim = hidden_dim
         elif self.embedding_type == 'gin+dghan':
             self.embedding_gin = GIN(in_dim=in_dim, hidden_dim=hidden_dim, layer_gin=embedding_l)
             self.embedding_dghan = DGHAN(in_dim=in_dim, hidden_dim=hidden_dim, dropout=dropout, layer_dghan=embedding_l, heads=heads)
+            base_embed_dim = hidden_dim * 2
         else:
             raise Exception('embedding type should be either "gin", "dghan", or "gin+dghan".')
 
-        # policy
+        policy_input_dim = base_embed_dim * 2
+
         self.policy = torch.nn.ModuleList()
         if policy_l == 1:
-            if self.embedding_type == 'gin+dghan':
-                self.policy.append(Sequential(Linear(hidden_dim * 4, hidden_dim),
-                                              # torch.nn.BatchNorm1d(hidden_dim),
-                                              torch.nn.Tanh(),
-                                              Linear(hidden_dim, hidden_dim)))
-            else:
-                self.policy.append(Sequential(Linear(hidden_dim * 2, hidden_dim),
-                                              # torch.nn.BatchNorm1d(hidden_dim),
-                                              torch.nn.Tanh(),
-                                              Linear(hidden_dim, hidden_dim)))
+            self.policy.append(
+                Sequential(
+                    Linear(policy_input_dim, hidden_dim),
+                    torch.nn.Tanh(),
+                    Linear(hidden_dim, hidden_dim)
+                )
+            )
         else:
             for layer in range(policy_l):
                 if layer == 0:
-                    if self.embedding_type == 'gin+dghan':
-                        self.policy.append(Sequential(Linear(hidden_dim * 4, hidden_dim),
-                                                      # torch.nn.BatchNorm1d(hidden_dim),
-                                                      torch.nn.Tanh(),
-                                                      Linear(hidden_dim, hidden_dim)))
-                    else:
-                        self.policy.append(Sequential(Linear(hidden_dim * 2, hidden_dim),
-                                                      # torch.nn.BatchNorm1d(hidden_dim),
-                                                      torch.nn.Tanh(),
-                                                      Linear(hidden_dim, hidden_dim)))
+                    self.policy.append(
+                        Sequential(
+                            Linear(policy_input_dim, hidden_dim),
+                            torch.nn.Tanh(),
+                            Linear(hidden_dim, hidden_dim)
+                        )
+                    )
                 else:
-                    self.policy.append(Sequential(Linear(hidden_dim, hidden_dim),
-                                                  # torch.nn.BatchNorm1d(hidden_dim),
-                                                  torch.nn.Tanh(),
-                                                  Linear(hidden_dim, hidden_dim)))
+                    self.policy.append(
+                        Sequential(
+                            Linear(hidden_dim, hidden_dim),
+                            torch.nn.Tanh(),
+                            Linear(hidden_dim, hidden_dim)
+                        )
+                    )
 
-        # Debug: If l2s_test is False, Activate it
-        # self.machine_window_encoder = Sequential(Linear(4, hidden_dim),
-        #                                          torch.nn.Tanh(),
-        #                                          Linear(hidden_dim, hidden_dim))
-        # self.machine_window_policy = Sequential(Linear(hidden_dim * 3, hidden_dim),
-        #                                         torch.nn.Tanh(),
-        #                                         Linear(hidden_dim, 1))
+        # window branch
+        # action_machine_feat: [A, n_mch, 9]
+        # last dim = 8 numeric feats + 1 valid mask
+        self.machine_feat_encoder = Sequential(
+            Linear(8, hidden_dim),
+            torch.nn.Tanh(),
+            Linear(hidden_dim, hidden_dim)
+        )
 
-    def _machine_window_bonus(self, node_embed_augmented, feasible_actions, action_machine_avail):
-        """Score feasible actions with the rolling-window machine availability branch."""
-        if action_machine_avail is None:
+        # anchor_embed + machine_mean + machine_max + scalar_embed
+        self.action_bonus_head = Sequential(
+            Linear(hidden_dim * 3, hidden_dim),
+            torch.nn.Tanh(),
+            Linear(hidden_dim, 1)
+        )
+
+        self.action_head = Sequential(
+            Linear(hidden_dim, hidden_dim),
+            torch.nn.Tanh(),
+            Linear(hidden_dim, 1)
+        )
+
+    @staticmethod
+    def _masked_mean_pool(machine_embed, machine_mask):
+        denom = machine_mask.sum(dim=1).clamp(min=1.0)
+        return (machine_embed * machine_mask).sum(dim=1) / denom
+
+    @staticmethod
+    def _masked_max_pool(machine_embed, machine_mask):
+        neg_large = torch.full_like(machine_embed, -1e9)
+        masked_embed = torch.where(machine_mask.bool(), machine_embed, neg_large)
+        pooled = masked_embed.max(dim=1).values
+        invalid_row = (machine_mask.sum(dim=1).squeeze(-1) <= 0)
+        if invalid_row.any():
+            pooled[invalid_row] = 0.0
+        return pooled
+
+    def _window_bonus(self,
+                      node_embed_augmented,
+                      feasible_actions,
+                      action_machine_feat):
+        if action_machine_feat is None:
             return None
 
         device = node_embed_augmented.device
         batch_size, n_nodes_per_state = node_embed_augmented.shape[:2]
-        action_bonus = torch.zeros((batch_size, n_nodes_per_state, n_nodes_per_state),
-                                   dtype=node_embed_augmented.dtype,
-                                   device=device)
 
-        for batch_idx, (state_actions, state_machine_avail) in enumerate(zip(feasible_actions, action_machine_avail)):
-            if state_machine_avail is None or len(state_actions) == 0:
+        action_bonus = torch.zeros(
+            (batch_size, n_nodes_per_state),
+            dtype=node_embed_augmented.dtype,
+            device=device
+        )
+
+        for batch_idx, (state_actions, state_machine_feat) in enumerate(
+                zip(feasible_actions, action_machine_feat)):
+
+            if len(state_actions) == 0:
                 continue
-            if state_machine_avail.shape[0] != len(state_actions):
-                raise ValueError('machine availability features must align with feasible actions.')
+            if state_machine_feat is None:
+                continue
+
+            if state_machine_feat.shape[0] != len(state_actions):
+                raise ValueError('action_machine_feat.shape[0] must equal number of feasible actions.')
 
             action_index = torch.as_tensor(state_actions, dtype=torch.long, device=device)
-            src_idx = action_index[:, 0]
-            dst_idx = action_index[:, 1]
 
-            machine_mask = state_machine_avail[..., -1:].to(dtype=node_embed_augmented.dtype)
-            machine_embed = self.machine_window_encoder(
-                state_machine_avail.reshape(-1, state_machine_avail.size(-1))
-            ).reshape(state_machine_avail.size(0), state_machine_avail.size(1), self.hidden_dim)
-            valid_machine_count = machine_mask.sum(dim=1).clamp(min=1.0)
-            window_embed = (machine_embed * machine_mask).sum(dim=1) / valid_machine_count
+            machine_raw = state_machine_feat[..., :-1]
+            machine_mask = state_machine_feat[..., -1:].to(dtype=node_embed_augmented.dtype)
 
-            action_repr = torch.cat([node_embed_augmented[batch_idx, src_idx],
-                                     node_embed_augmented[batch_idx, dst_idx],
-                                     window_embed], dim=-1)
-            action_bonus[batch_idx, src_idx, dst_idx] = self.machine_window_policy(action_repr).squeeze(-1)
+            machine_embed = self.machine_feat_encoder(
+                machine_raw.reshape(-1, machine_raw.size(-1))
+            ).reshape(
+                state_machine_feat.size(0),
+                state_machine_feat.size(1),
+                self.hidden_dim
+            )
+
+            anchor_embed = node_embed_augmented[batch_idx, action_index, :]
+
+            action_repr = torch.cat(
+                [anchor_embed, machine_embed.reshape(-1, self.hidden_dim)],
+                dim=-1
+            )
+
+            action_bonus[batch_idx, action_index] = self.action_bonus_head(action_repr).squeeze(-1)
 
         return action_bonus
 
-    def forward(self, batch_states, feasible_actions, l2s_test=True):
-
+    def forward(self, batch_states, feasible_actions):
         if self.embedding_type == 'gin':
-            node_embed, graph_embed = self.embedding(batch_states.x,
-                                                     add_self_loops(torch.cat([batch_states.edge_index_pc,
-                                                                               batch_states.edge_index_mc],
-                                                                              dim=-1))[0],
-                                                     batch_states.batch)
+            node_embed, graph_embed = self.embedding(
+                batch_states.x,
+                add_self_loops(torch.cat([batch_states.edge_index_pc, batch_states.edge_index_mc], dim=-1))[0],
+                batch_states.batch
+            )
         elif self.embedding_type == 'dghan':
-            node_embed, graph_embed = self.embedding(batch_states.x,
-                                                     add_self_loops(batch_states.edge_index_pc)[0],
-                                                     add_self_loops(batch_states.edge_index_mc)[0],
-                                                     len(feasible_actions))
+            node_embed, graph_embed = self.embedding(
+                batch_states.x,
+                add_self_loops(batch_states.edge_index_pc)[0],
+                add_self_loops(batch_states.edge_index_mc)[0],
+                len(feasible_actions)
+            )
         elif self.embedding_type == 'gin+dghan':
-            node_embed_gin, graph_embed_gin = self.embedding_gin(batch_states.x,
-                                                                 add_self_loops(torch.cat([batch_states.edge_index_pc,
-                                                                                           batch_states.edge_index_mc],
-                                                                                          dim=-1))[0],
-                                                                 batch_states.batch)
-            node_embed_dghan, graph_embed_dghan = self.embedding_dghan(batch_states.x,
-                                                                       add_self_loops(batch_states.edge_index_pc)[0],
-                                                                       add_self_loops(batch_states.edge_index_mc)[0],
-                                                                       len(feasible_actions))
+            node_embed_gin, graph_embed_gin = self.embedding_gin(
+                batch_states.x,
+                add_self_loops(torch.cat([batch_states.edge_index_pc, batch_states.edge_index_mc], dim=-1))[0],
+                batch_states.batch
+            )
+            node_embed_dghan, graph_embed_dghan = self.embedding_dghan(
+                batch_states.x,
+                add_self_loops(batch_states.edge_index_pc)[0],
+                add_self_loops(batch_states.edge_index_mc)[0],
+                len(feasible_actions)
+            )
             node_embed = torch.cat([node_embed_gin, node_embed_dghan], dim=-1)
             graph_embed = torch.cat([graph_embed_gin, graph_embed_dghan], dim=-1)
         else:
@@ -248,64 +291,65 @@ class Actor(nn.Module):
         batch_size = graph_embed.shape[0]
         n_nodes_per_state = node_embed.shape[0] // batch_size
 
-        # augment node embedding with graph embedding then forwarding policy
-        node_embed_augmented = torch.cat([node_embed, graph_embed.repeat_interleave(repeats=n_nodes_per_state, dim=0)], dim=-1).reshape(batch_size, n_nodes_per_state, -1)
+        node_embed_augmented = torch.cat(
+            [
+                node_embed,
+                graph_embed.repeat_interleave(repeats=n_nodes_per_state, dim=0)
+            ],
+            dim=-1
+        ).reshape(batch_size, n_nodes_per_state, -1)
+
         for layer in range(self.policy_l):
             node_embed_augmented = self.policy[layer](node_embed_augmented)
 
-        # action score
-        action_score = torch.bmm(node_embed_augmented, node_embed_augmented.transpose(-1, -2))
-        if not l2s_test:
-            action_window_bonus = self._machine_window_bonus(
-                node_embed_augmented,
-                feasible_actions,
-                getattr(batch_states, 'feasible_action_machine_avail', None),
-            )
-            if action_window_bonus is not None:
-                action_score = action_score + action_window_bonus
+        action_score = self.action_head(node_embed_augmented).squeeze(-1)
 
-        # prepare mask
-        carries = np.arange(0, batch_size * n_nodes_per_state, n_nodes_per_state)
-        a_merge = []  # merge index of actions of all states
-        action_count = []  # list of #actions for each state
-        for i in range(len(feasible_actions)):
-            action_count.append(len(feasible_actions[i]))
-            for j in range(len(feasible_actions[i])):
-                a_merge.append([feasible_actions[i][j][0] + carries[i], feasible_actions[i][j][1]])
-        a_merge = np.array(a_merge)
-        mask = torch.ones(size=[batch_size * n_nodes_per_state, n_nodes_per_state], dtype=torch.bool, device=device)
-        mask[a_merge[:, 0], a_merge[:, 1]] = False
-        mask.resize_as_(action_score)
+        action_window_bonus = self._window_bonus(
+            node_embed_augmented=node_embed_augmented,
+            feasible_actions=feasible_actions,
+            action_machine_feat=getattr(batch_states, 'feasible_action_machine_feat', None),
+        )
 
-        # pi
+        if action_window_bonus is not None:
+            action_score = action_score + action_window_bonus
+
+        mask = torch.ones((batch_size, n_nodes_per_state), dtype=torch.bool, device=device)
+        for batch_idx, state_actions in enumerate(feasible_actions):
+            if len(state_actions) == 0:
+                continue
+            action_index = torch.as_tensor(state_actions, dtype=torch.long, device=device)
+            mask[batch_idx, action_index] = False
+
         action_score.masked_fill_(mask, -np.inf)
-        action_score_flat = action_score.reshape(batch_size, 1, -1)
-        pi = F.softmax(action_score_flat, dim=-1)
 
-        dist = Categorical(probs=pi)
+        dist = Categorical(logits=action_score)
         actions_id = dist.sample()
-        # actions_id = torch.argmax(pi, dim=-1)  # greedy action
-        sampled_actions = [[actions_id[i].item() // n_nodes_per_state, actions_id[i].item() % n_nodes_per_state] for i in range(len(feasible_actions))]
-        log_prob = dist.log_prob(actions_id)  # log_prob using Pytorch API, this will have a gradient shift, reference: https://github.com/pytorch/pytorch/issues/61727. Used in paper submission version.
-        # log_prob = torch.log(torch.gather(pi, -1, actions_id.unsqueeze(-1)) + -1e-7).squeeze(-1)  # log_prob calculated manually, this will not have a gradient shift. Switch to this after paper submission.
+        sampled_actions = actions_id.tolist()
+        log_prob = dist.log_prob(actions_id).unsqueeze(-1)
+
         return sampled_actions, log_prob
 
 
 if __name__ == '__main__':
     import random
-    from env.environment import JsspN5, BatchGraph
-    from env.generateJSP import uni_instance_gen
+    from env.environment import JsspWindow, BatchGraph
 
+    def _bind_main_process_away_from_cpu0():
+        if not hasattr(os, 'sched_getaffinity') or not hasattr(os, 'sched_setaffinity'):
+            return None
+        current = set(os.sched_getaffinity(0))
+        allowed = {cpu for cpu in current if cpu != 0}
+        target = allowed if allowed else current
+        os.sched_setaffinity(0, target)
+        return set(os.sched_getaffinity(0))
+
+    affinity = _bind_main_process_away_from_cpu0()
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    n_j = 10
-    n_m = 10
+    n_j = 20
+    n_m = 15
     l = 1
     h = 99
-    reward_type = 'yaoxin'
-    init_type = 'fdd-divide-mwkr'
-    b_size = 2
-    transit = 1
     hid_dim = 128
 
     torch.manual_seed(1)
@@ -313,31 +357,14 @@ if __name__ == '__main__':
     np.random.seed(1)
     random.seed(1)
 
-    env = JsspN5(n_job=n_j, n_mch=n_m, low=l, high=h, reward_type=reward_type)
-    batch_data = BatchGraph()
-    # instances = np.load('../test_data/syn{}x{}.npy'.format(n_j, n_m))
-    instances = np.load('../validation_data/validation_instance_{}x{}[{},{}].npy'.format(n_j, n_m, l, h))
-    # instances = np.array([uni_instance_gen(n_j=n_j, n_m=n_m, low=l, high=h) for _ in range(b_size)])
-    states, feasible_as, dones = env.reset(instances=instances, init_type=init_type, device=dev)
-    # print(env.incumbent_objs)
-    # print(feasible_as)
-    actor = Actor(3, hid_dim, embedding_l=4, policy_l=4, embedding_type='gin+dghan', heads=1, dropout=0.0).to(dev)
+    actor = Actor(
+        in_dim=3,
+        hidden_dim=hid_dim,
+        embedding_l=4,
+        policy_l=4,
+        embedding_type='gin+dghan',
+        heads=1,
+        dropout=0.0
+    ).to(dev)
 
-    while env.itr < 500:
-        from torchsummary import summary
-        batch_data.wrapper(*states)
-        # summary(actor, input_size=batch_data.shape, device=dev)
-        actions, log_ps = actor(batch_data, feasible_as)
-        states, rewards, feasible_as, dones = env.step(actions, dev)
-        # print(actions)
-        # print(env.incumbent_objs)
-        # print(feasible_as)
-
-    # grad = torch.autograd.grad(log_ps.sum(), [param for param in actor.parameters()])
-
-    # print(env.incumbent_objs)
-    # print(np.load('./validation_data/validation{}x{}_ortools_result.npy'.format(n_j, n_m)))
-
-    optimal = np.load('../validation_data/validation{}x{}_ortools_result.npy'.format(n_j, n_m))
-    gap = ((env.current_objs.view(-1).cpu().numpy() - optimal)/optimal).mean()
-    print(gap)
+    print(actor)

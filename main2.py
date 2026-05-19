@@ -362,11 +362,11 @@ def print_window_machine_interval_comparison(
 def large_neiborhood_search(
     jsp_instance: dict, 
     est: list, 
-    use_multi_window=False,
     window_size=10,
     max_iterations=100, 
     debug="all_windows", 
     cp_mode=False,
+    neighborhood_mode="random",
     plot_improvements=False,
     plot_dir="gantt_improvements",
     return_history=False, 
@@ -405,27 +405,123 @@ def large_neiborhood_search(
             }
             return best_solution, best_makespan, history
         return best_solution, best_makespan
+
+    mode_alias = {"geedy": "greedy"}
+    valid_modes = {"random", "greedy", "best_improve", "first_improve"}
+    neighborhood_mode = mode_alias.get(neighborhood_mode.lower(), neighborhood_mode.lower())
+    if neighborhood_mode not in valid_modes:
+        raise ValueError(
+            f"Unsupported neighborhood_mode '{neighborhood_mode}'. "
+            f"Expected one of {sorted(valid_modes)}"
+        )
+
+    def _window_idx_from_crit_op(crit_op, sorted_ops_ref):
+        idx = sorted_ops_ref.index(crit_op)
+        return min(idx, nopr - window_size)
+
+    def _compute_window_slack(ops_in_window, start_times):
+        machine_avail = get_machine_window_availability(
+            ops_in_window,
+            start_times,
+            duration,
+            jsp_instance["mch"],
+        )
+        total_op_time = 0
+        for job, op in ops_in_window:
+            total_op_time += duration[job][op]
+
+        total_span = sum(latest - earliest for earliest, latest in machine_avail.values())
+        return total_span - total_op_time
+
+    def _optimize_single_window(base_start_times, sorted_ops_ref, window_idx):
+        op_start_times_local = [row[:] for row in base_start_times]
+        ops_in_window_local = list(sorted_ops_ref[window_idx:window_idx + window_size])
+        machine_avail = get_machine_window_availability(
+            ops_in_window_local, op_start_times_local, duration, jsp_instance["mch"]
+        )
+        window_result = solve_window_with_machine_avail(
+            jsp_instance,
+            ops_in_window_local,
+            op_start_times_local,
+            machine_avail,
+        )
+        if not window_result:
+            return None, None, ops_in_window_local
+
+        ref_start_times = [row[:] for row in op_start_times_local]
+        for (job, op), st in window_result.items():
+            op_start_times_local[job][op] = st
+
+        orders = [[] for _ in range(m)]
+        for machine in range(m):
+            machine_ops = [
+                (job, op)
+                for job in range(j)
+                for op in range(m)
+                if jsp_instance["mch"][job][op] == machine
+            ]
+            machine_ops.sort(
+                key=lambda item: (
+                    op_start_times_local[item[0]][item[1]],
+                    ref_start_times[item[0]][item[1]],
+                    item[0],
+                    item[1],
+                )
+            )
+            orders[machine] = machine_ops
+
+        rebuilt_start_times = [[0] * m for _ in range(j)]
+        machine_ready = [0] * m
+        job_ready = [0] * j
+        order_idx = [0] * m
+        scheduled_ops = set()
+        while len(scheduled_ops) < nopr:
+            progress = False
+            for machine in range(m):
+                if order_idx[machine] >= len(orders[machine]):
+                    continue
+                job, op = orders[machine][order_idx[machine]]
+                if (job, op) in scheduled_ops:
+                    order_idx[machine] += 1
+                    continue
+                if op > 0 and (job, op - 1) not in scheduled_ops:
+                    continue
+
+                start_time = max(job_ready[job], machine_ready[machine])
+                rebuilt_start_times[job][op] = start_time
+                end_time = start_time + duration[job][op]
+                job_ready[job] = end_time
+                machine_ready[machine] = end_time
+                scheduled_ops.add((job, op))
+                order_idx[machine] += 1
+                progress = True
+            if not progress:
+                raise ValueError("调度过程中没有进展，可能是orders中的操作顺序不合理，导致死锁")
+
+        makespan_local = max(
+            rebuilt_start_times[job][m - 1] + duration[job][m - 1]
+            for job in range(j)
+        )
+        return rebuilt_start_times, makespan_local, ops_in_window_local
     
     count = 0
     it = 0
     roll_count = 0
     find_better_in_this_iteration = True
     while it < max_iterations:
-        # if (best_makespan - jsp_instance["makespan"][0]) / jsp_instance["makespan"][0] * 100 <= 1:
-        #     break
         op_start_times = [row[:] for row in best_solution]
 
-        # 随机选一条关键路径
         _est = [row[:] for row in op_start_times]
-        # _lst = compute_lst(jsp_instance, op_start_times)
-        # 1. 找到makespan对应的终点操作（即结束时间等于makespan的操作）
-        makespan = max(_est[job][jsp_instance["m"]-1] + jsp_instance["duration"][job][jsp_instance["m"]-1] for job in range(jsp_instance["j"]))
+        makespan = max(
+            _est[job][jsp_instance["m"] - 1] + jsp_instance["duration"][job][jsp_instance["m"] - 1]
+            for job in range(jsp_instance["j"])
+        )
         end_ops = []
         for job in range(jsp_instance["j"]):
             op = jsp_instance["m"] - 1
             if abs(_est[job][op] + jsp_instance["duration"][job][op] - makespan) < 1e-6:
                 end_ops.append((job, op))
-        # 2. 从某个终点操作反向随机追溯一条关键路径
+
         def trace_critical_path(start_op):
             path = [start_op]
             job, op = start_op
@@ -436,18 +532,19 @@ def large_neiborhood_search(
                     for o2 in range(jsp_instance["m"]):
                         if jsp_instance["mch"][j2][o2] == mach:
                             ops_on_machine.append((j2, o2))
-                # 按开始时间排序
                 ops_on_machine.sort(key=lambda x: _est[x[0]][x[1]])
                 machine_ops_order[mach] = ops_on_machine
 
             while True:
                 prev_candidates = []
-                # 工件顺序
                 if op > 0:
-                    prev_job_op = (job, op-1)
-                    if abs(_est[prev_job_op[0]][prev_job_op[1]] + jsp_instance["duration"][prev_job_op[0]][prev_job_op[1]] - _est[job][op]) < 1e-6:
+                    prev_job_op = (job, op - 1)
+                    if abs(
+                        _est[prev_job_op[0]][prev_job_op[1]]
+                        + jsp_instance["duration"][prev_job_op[0]][prev_job_op[1]]
+                        - _est[job][op]
+                    ) < 1e-6:
                         prev_candidates.append(prev_job_op)
-                # 机器顺序
                 machine = jsp_instance["mch"][job][op]
                 ops_on_machine = machine_ops_order[machine]
                 idx = ops_on_machine.index((job, op))
@@ -462,601 +559,149 @@ def large_neiborhood_search(
                 path.append(prev_op)
                 job, op = prev_op
             return list(reversed(path))
-        if not end_ops:
-            critical_ops = []
-        else: 
-            start_op = random.choice(end_ops)
-            critical_ops = trace_critical_path(start_op)
 
-        # print(len(critical_ops), " critical operations in iteration ", it) 1746
-        # Debug
-        # critical_ops = [(job, op) for job in range(j) for op in range(m)]
+        critical_ops = [] if not end_ops else trace_critical_path(random.choice(end_ops))
         if len(critical_ops) == 0:
-            window_idx = random.randint(0, nopr - window_size)
             raise AssertionError("没有找到关键路径上的操作，可能是计算lst时出现了问题")
-        else:
-            crit_op = random.choice(critical_ops)
-            if step_action is not None:
-                assert len(step_action) == max_iterations, f"step_action长度 {len(step_action)} 不等于 max_iterations {max_iterations}"
-                crit_op_id = step_action[it]
-                crit_op = (crit_op_id // m, crit_op_id % m)
-            window_idx = sorted_ops.index(crit_op)
-            # 保证窗口不会越界
-            if window_idx > nopr - window_size:
-                window_idx = nopr - window_size
-            it += 1
-            # if find_better_in_this_iteration:
-            #     # 找到更优解后，roll_count重置为0，it增加1，继续在关键路径上寻找更优解；
-            #     crit_op = random.choice(critical_ops)
-            #     window_idx = sorted_ops.index(crit_op)
-            #     # 保证窗口不会越界
-            #     if window_idx > nopr - window_size:
-            #         window_idx = nopr - window_size
-            #     roll_count = 0
-            #     it += 1
-            # else:
-            #     # 如果在当前窗口附近没有找到更优解，roll_count增加1，在后一个窗口附近寻找；如果窗口越界，roll_count重置，it增加1，继续寻找更优解。
-            #     if use_multi_window or (debug == "single_windows" or debug == "suffix_windows"):
-            #         it += 1
-            #         find_better_in_this_iteration = True
-            #         continue
-            #     if roll_count == 0:
-            #         next_window_idx = window_idx % window_size
-            #     else:
-            #         next_window_idx = window_idx + window_size
-            #     if next_window_idx > nopr - window_size:
-            #         roll_count = 0
-            #         # print(f"Iteration {it}: No improvement found in current segement")
-            #         it += 1
-            #         crit_op = random.choice(critical_ops)
-            #         window_idx = sorted_ops.index(crit_op)
-            #         # 保证窗口不会越界
-            #         if window_idx > nopr - window_size:
-            #             window_idx = nopr - window_size
-            #         find_better_in_this_iteration = True 
-            #     else:
-            #         window_idx = next_window_idx
-            #         roll_count += 1
 
+        selected_window_idx = None
+        selected_ops_in_window = None
+        candidate_start_times = None
+        candidate_makespan = None
+        force_restart_accept = False
 
-        ops_in_window = sorted_ops[window_idx:window_idx + window_size]
-        focus_window_before = sorted(
-            ops_in_window,
-            key=lambda item: op_start_times[item[0]][item[1]],
-        )
-        if cp_mode:
-            assert max_iterations == 1, f"CP mode must make iteration as 1"
-            assert debug == 'single_windows', f"CP mode debug must be single window"
-            ops_in_window = sorted_ops[:]
-            machine_avail = get_machine_window_availability(
-                    ops_in_window, op_start_times, duration, jsp_instance["mch"]
+        if step_action is not None:
+            assert len(step_action) == max_iterations, f"step_action长度 {len(step_action)} 不等于 max_iterations {max_iterations}"
+            crit_op_id = step_action[it]
+            crit_op = (crit_op_id // m, crit_op_id % m)
+            selected_window_idx = _window_idx_from_crit_op(crit_op, sorted_ops)
+        elif neighborhood_mode == "random":
+            selected_window_idx = _window_idx_from_crit_op(random.choice(critical_ops), sorted_ops)
+        elif neighborhood_mode == "greedy":
+            best_slack = None
+            for crit_op in critical_ops:
+                cur_idx = _window_idx_from_crit_op(crit_op, sorted_ops)
+                ops_in_window = sorted_ops[cur_idx:cur_idx + window_size]
+                cur_slack = _compute_window_slack(ops_in_window, op_start_times)
+                if best_slack is None or cur_slack > best_slack:
+                    best_slack = cur_slack
+                    selected_window_idx = cur_idx
+        elif neighborhood_mode == "best_improve":
+            best_improve_value = 0
+            best_candidate = None
+            all_candidates = []
+            for crit_op in critical_ops:
+                cur_idx = _window_idx_from_crit_op(crit_op, sorted_ops)
+                cand_start_times, cand_makespan, cand_ops = _optimize_single_window(
+                    op_start_times,
+                    sorted_ops,
+                    cur_idx,
                 )
-                # st = time()
-            window_result = solve_window_with_machine_avail(jsp_instance, 
-                                                            ops_in_window, 
-                                                            op_start_times, 
-                                                            machine_avail)
-            for (job, op), st in window_result.items():
-                op_start_times[job][op] = st
-            makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
-            if makespan < best_makespan:
-                makespan_update_iterations.append(it)
-                makespan_update_values.append(makespan)
-                best_makespan = makespan
-                last_decrease_iteration = it
+                if cand_start_times is None:
+                    continue
+                all_candidates.append((cur_idx, cand_start_times, cand_makespan, cand_ops))
+                improve = best_makespan - cand_makespan
+                if improve > best_improve_value:
+                    best_improve_value = improve
+                    best_candidate = (cur_idx, cand_start_times, cand_makespan, cand_ops)
+            if best_candidate is not None:
+                selected_window_idx, candidate_start_times, candidate_makespan, selected_ops_in_window = best_candidate
+            elif all_candidates:
+                min_makespan = min(item[2] for item in all_candidates)
+                best_pool = [item for item in all_candidates if item[2] == min_makespan]
+                selected_window_idx, candidate_start_times, candidate_makespan, selected_ops_in_window = random.choice(best_pool)
+                force_restart_accept = True
+        elif neighborhood_mode == "first_improve":
+            all_candidates = []
+            for crit_op in critical_ops:
+                cur_idx = _window_idx_from_crit_op(crit_op, sorted_ops)
+                cand_start_times, cand_makespan, cand_ops = _optimize_single_window(
+                    op_start_times,
+                    sorted_ops,
+                    cur_idx,
+                )
+                if cand_start_times is None:
+                    continue
+                all_candidates.append((cur_idx, cand_start_times, cand_makespan, cand_ops))
+                if cand_makespan < best_makespan:
+                    selected_window_idx = cur_idx
+                    candidate_start_times = cand_start_times
+                    candidate_makespan = cand_makespan
+                    selected_ops_in_window = cand_ops
+                    break
+            if selected_window_idx is None and all_candidates:
+                min_makespan = min(item[2] for item in all_candidates)
+                best_pool = [item for item in all_candidates if item[2] == min_makespan]
+                selected_window_idx, candidate_start_times, candidate_makespan, selected_ops_in_window = random.choice(best_pool)
+                force_restart_accept = True
+
+        it += 1
+
+        if selected_window_idx is None:
             all_iterations.append(it)
             all_best_makespans.append(best_makespan)
-            if return_history:
-                history = {
-                    "update_iterations": makespan_update_iterations,
-                    "update_makespans": makespan_update_values,
-                    "all_iterations": all_iterations,
-                    "all_best_makespans": all_best_makespans,
-                    "last_decrease_iteration": last_decrease_iteration,
-                    "best_iteration": makespan_update_iterations[-1],
-                }
-                return op_start_times, makespan, history
-            return op_start_times, makespan
+            continue
+
+        if selected_ops_in_window is None:
+            selected_ops_in_window = sorted_ops[selected_window_idx:selected_window_idx + window_size]
+        focus_window_before = sorted(
+            selected_ops_in_window,
+            key=lambda item: op_start_times[item[0]][item[1]],
+        )
+        # if cp_mode:
+        #     assert max_iterations == 1, f"CP mode must make iteration as 1"
+        #     assert debug == 'single_windows', f"CP mode debug must be single window"
+        #     ops_in_window = sorted_ops[:]
+        #     machine_avail = get_machine_window_availability(
+        #             ops_in_window, op_start_times, duration, jsp_instance["mch"]
+        #         )
+        #         # st = time()
+        #     window_result = solve_window_with_machine_avail(jsp_instance, 
+        #                                                     ops_in_window, 
+        #                                                     op_start_times, 
+        #                                                     machine_avail)
+        #     for (job, op), st in window_result.items():
+        #         op_start_times[job][op] = st
+        #     makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
+        #     if makespan < best_makespan:
+        #         makespan_update_iterations.append(it)
+        #         makespan_update_values.append(makespan)
+        #         best_makespan = makespan
+        #         last_decrease_iteration = it
+        #     all_iterations.append(it)
+        #     all_best_makespans.append(best_makespan)
+        #     if return_history:
+        #         history = {
+        #             "update_iterations": makespan_update_iterations,
+        #             "update_makespans": makespan_update_values,
+        #             "all_iterations": all_iterations,
+        #             "all_best_makespans": all_best_makespans,
+        #             "last_decrease_iteration": last_decrease_iteration,
+        #             "best_iteration": makespan_update_iterations[-1],
+        #         }
+        #         return op_start_times, makespan, history
+        #     return op_start_times, makespan
             
+        if candidate_start_times is None:
+            candidate_start_times, candidate_makespan, selected_ops_in_window = _optimize_single_window(
+                op_start_times,
+                sorted_ops,
+                selected_window_idx,
+            )
+            if candidate_start_times is None:
+                all_iterations.append(it)
+                all_best_makespans.append(best_makespan)
+                continue
 
-        if use_multi_window:
-            if debug == 'all_windows':
-                multi_ops_in_windows = []
-                multi_machine_avail = []
-                windows_data = []
-                start_idx = window_idx % window_size
-                total_windows = nopr // window_size
-                if start_idx > 0:
-                    first_ops_in_window = sorted_ops[0:start_idx]
-                    # print("first ops in window:", len(first_ops_in_window))
-                    multi_ops_in_windows.append(first_ops_in_window)
-                assert total_windows > 0, f"窗口大小 {window_size} 太大，无法划分出完整的窗口，nopr: {nopr}"
-                if total_windows > 0:
-                    window_list = [sorted_ops[start_idx + i*window_size:start_idx + (i+1)*window_size] for i in range(0, total_windows)]
-                    # print("total ops in windows_list:", sum(len(w) for w in window_list))
-                    multi_ops_in_windows.extend(window_list)
-                if start_idx + total_windows * window_size < nopr:
-                    last_ops_in_window = sorted_ops[start_idx + total_windows * window_size:]
-                    # print("last ops in window:", len(last_ops_in_window))
-                    multi_ops_in_windows.append(last_ops_in_window)
-                assert sum(len(w) for w in multi_ops_in_windows) == nopr, f"多窗口划分错误，操作总数不匹配: {sum(len(w) for w in multi_ops_in_windows)} vs {nopr}"
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = get_machine_window_availability(
-                        ops_in_window, op_start_times, duration, jsp_instance["mch"]
-                    )
-                    multi_machine_avail.append(machine_avail)
-                    windows_data.append((ops_in_window, machine_avail, i))
-
-                if not check_machine_feasibility(multi_machine_avail):
-                    raise ValueError("窗口内机器可用时间不合理，可能是计算机器可用时间时出现了问题")
-
-                results = solve_multiple_windows_parallel(jsp_instance, op_start_times, windows_data)
-                results.sort(key=lambda x: x[1])  # 按窗口索引排序，保证结果顺序与窗口顺序一致
-                assert len(results) == len(multi_ops_in_windows), f"求解结果数量 {len(results)} 与窗口数量 {len(multi_ops_in_windows)} 不匹配"
-
-                # 3. 更新解析结果到op_start_times
-                orders = [[] for _ in range(m)]
-                for (result, i) in results:
-                    if not result:
-                        raise ValueError(f"窗口 {i} 求解失败，可能是模型无解或者求解时间过短导致的。")
-                        continue  # 跳过求解失败的窗口
-                    ops_in_window = multi_ops_in_windows[i]
-                    ops_in_window.sort(key=lambda x: result[x[0], x[1]]) 
-                    for (job, op), st in result.items():
-                        machine = jsp_instance["mch"][job][op]
-                        orders[machine].append((job, op))
-                assert all([len(o) == j for o in orders]), f"某台机器的操作数量不正确: {[len(o) for o in orders]} vs {j}"
-            elif debug == 'prefix_windows':
-                multi_ops_in_windows = []
-                multi_machine_avail = []
-                windows_data = []
-                start_idx = window_idx % window_size
-                total_windows = window_idx // window_size
-                multi_ops_in_windows.append(sorted_ops[0:start_idx])
-                if total_windows > 0:
-                    window_list = [sorted_ops[start_idx + i*window_size:start_idx + (i+1)*window_size] for i in range(0, total_windows)]
-                    multi_ops_in_windows.extend(window_list)
-                assert sum(len(w) for w in multi_ops_in_windows) == window_idx, f"多窗口划分错误，操作总数不匹配: {sum(len(w) for w in multi_ops_in_windows)} vs {window_idx}"
-
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = get_machine_window_availability(
-                        ops_in_window, op_start_times, duration, jsp_instance["mch"]
-                    )
-                    multi_machine_avail.append(machine_avail)
-                    windows_data.append((ops_in_window, machine_avail, i))
-                
-                if not check_machine_feasibility(multi_machine_avail):
-                    raise ValueError("窗口内机器可用时间不合理，可能是计算机器可用时间时出现了问题")
-                
-                # st = time()
-                # temp = solve_window_with_machine_avail(jsp_instance, multi_ops_in_windows[0], op_start_times, multi_machine_avail[0])
-                # ed = time()
-                # print(f"Single window solving took {ed - st:.2f} seconds")
-
-                # st = time()
-                results = solve_multiple_windows_parallel(jsp_instance, op_start_times, windows_data)
-                # ed = time()
-                # print(f"Parallel solving for multiple windows took {ed - st:.2f} seconds")
-                # import sys
-                # sys.exit(0)
-                results.sort(key=lambda x: x[1])  # 按窗口索引排序，保证结果顺序与窗口顺序一致
-
-                orders = [[] for _ in range(m)]
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = multi_machine_avail[i]
-                    result = results[i][0]
-                    if not result:
-                        ops_in_window.sort(key=lambda x: op_start_times[x[0]][x[1]])  # 按原始开始时间排序
-                    else:
-                        ops_in_window.sort(key=lambda x: result[x[0], x[1]])
-                    for job, op in ops_in_window:
-                        machine = jsp_instance["mch"][job][op]
-                        orders[machine].append((job, op))
-
-                for ops in sorted_ops[window_idx:]:
-                    job, op = ops
-                    machine = jsp_instance["mch"][job][op]
-                    orders[machine].append((job, op))
-                assert all([len(o) == j for o in orders]), f"某台机器的操作数量不正确: {[len(o) for o in orders]} vs {j}"
-            else:
-                multi_ops_in_windows = []
-                multi_machine_avail = []
-                windows_data = []
-                start_idx = window_idx 
-                total_windows = (nopr - start_idx) // window_size
-                if total_windows == 0:
-                    # only one window
-                    multi_ops_in_windows.append(sorted_ops[start_idx:])
-                else:
-                    window_list = [sorted_ops[start_idx + i*window_size:start_idx + (i+1)*window_size] for i in range(0, total_windows)]
-                    multi_ops_in_windows.extend(window_list)
-                    if start_idx + total_windows * window_size < nopr:
-                        last_ops_in_window = sorted_ops[start_idx + total_windows * window_size:]
-                        multi_ops_in_windows.append(last_ops_in_window)
-                assert sum(len(w) for w in multi_ops_in_windows) == nopr - start_idx, f"多窗口划分错误，操作总数不匹配: {sum(len(w) for w in multi_ops_in_windows)} vs {nopr - start_idx}"
-
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = get_machine_window_availability(
-                        ops_in_window, op_start_times, duration, jsp_instance["mch"]
-                    )
-                    multi_machine_avail.append(machine_avail)
-                    windows_data.append((ops_in_window, machine_avail, i))
-                
-                if not check_machine_feasibility(multi_machine_avail):
-                    raise ValueError("窗口内机器可用时间不合理，可能是计算机器可用时间时出现了问题")
-                
-                # st = time()
-                # temp = solve_window_with_machine_avail(jsp_instance, multi_ops_in_windows[0], op_start_times, multi_machine_avail[0])
-                # ed = time()
-                # print(f"Single window solving took {ed - st:.2f} seconds")
-
-                # st = time()
-                results = solve_multiple_windows_parallel(jsp_instance, op_start_times, windows_data)
-                # ed = time()
-                # print(f"Parallel solving for multiple windows took {ed - st:.2f} seconds")
-                # import sys
-                # sys.exit(0)
-                results.sort(key=lambda x: x[1])  # 按窗口索引排序，保证结果顺序与窗口顺序一致
-
-                orders = [[] for _ in range(m)]
-                # 对于前面的操作保证顺序不变，直接加入orders
-                for ops in sorted_ops[:start_idx]:
-                    job, op = ops
-                    machine = jsp_instance["mch"][job][op]
-                    orders[machine].append((job, op))
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = multi_machine_avail[i]
-                    result = results[i][0]
-                    if not result:
-                        ops_in_window.sort(key=lambda x: op_start_times[x[0]][x[1]])  # 按原始开始时间排序
-                    else:
-                        ops_in_window.sort(key=lambda x: result[x[0], x[1]])
-                    for job, op in ops_in_window:
-                        machine = jsp_instance["mch"][job][op]
-                        orders[machine].append((job, op))
-                assert all([len(o) == j for o in orders]), f"某台机器的操作数量不正确: {[len(o) for o in orders]} vs {j}"
-            # 实现根据orders更新op_start_times的逻辑，确保工件顺序约束和机器约束都得到满足
-            # 这里需要一个调度逻辑，按照orders中每台机器的操作顺序，计算每个操作的开始时间，并更新op_start_times
-            machine_ready = [0] * m
-            job_ready = [0] * j
-            order_idx = [0] * m  # 记录每台机器当前调度到哪个操作
-            scheduled_ops = set()
-            while len(scheduled_ops) < nopr:
-                progress = False
-                for machine in range(m):
-                    if order_idx[machine] >= len(orders[machine]):
-                        continue
-                    job, op = orders[machine][order_idx[machine]]
-                    if (job, op) in scheduled_ops:
-                        order_idx[machine] += 1
-                        continue
-                    # 检查工件前一个操作是否完成
-                    if op > 0 and (job, op-1) not in scheduled_ops:
-                        continue
-                    # 可以调度这个操作了
-                    start_time = max(job_ready[job], machine_ready[machine])
-                    op_start_times[job][op] = start_time
-                    end_time = start_time + duration[job][op]
-                    job_ready[job] = end_time
-                    machine_ready[machine] = end_time
-                    scheduled_ops.add((job, op))
-                    order_idx[machine] += 1
-                    progress = True
-                if not progress:
-                    raise ValueError("调度过程中没有进展，可能是orders中的操作顺序不合理，导致死锁")
-            makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
-            # print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
+        op_start_times = candidate_start_times
+        makespan = candidate_makespan
+        should_accept = False
+        if neighborhood_mode in {"best_improve", "first_improve"}:
+            should_accept = makespan < best_makespan or force_restart_accept
         else:
-            if debug == 'all_windows':
-                multi_ops_in_windows = []
-                multi_machine_avail = []
-                windows_data = []
-                start_idx = window_idx % window_size
-                total_windows = nopr // window_size
-                if start_idx > 0:
-                    first_ops_in_window = sorted_ops[0:start_idx]
-                    # print("first ops in window:", len(first_ops_in_window))
-                    multi_ops_in_windows.append(first_ops_in_window)
-                assert total_windows > 0, f"窗口大小 {window_size} 太大，无法划分出完整的窗口，nopr: {nopr}"
-                if total_windows > 0:
-                    window_list = [sorted_ops[start_idx + i*window_size:start_idx + (i+1)*window_size] for i in range(0, total_windows)]
-                    # print("total ops in windows_list:", sum(len(w) for w in window_list))
-                    multi_ops_in_windows.extend(window_list)
-                if start_idx + total_windows * window_size < nopr:
-                    last_ops_in_window = sorted_ops[start_idx + total_windows * window_size:]
-                    # print("last ops in window:", len(last_ops_in_window))
-                    multi_ops_in_windows.append(last_ops_in_window)
-                assert sum(len(w) for w in multi_ops_in_windows) == nopr, f"多窗口划分错误，操作总数不匹配: {sum(len(w) for w in multi_ops_in_windows)} vs {nopr}"
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = get_machine_window_availability(
-                        ops_in_window, op_start_times, duration, jsp_instance["mch"]
-                    )
-                    multi_machine_avail.append(machine_avail)
-                orders = [[] for _ in range(m)]
-                # print(f"Total Windows in Debug: {len(multi_ops_in_windows)}")
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = multi_machine_avail[i]
-                    result = solve_window_with_machine_avail(jsp_instance, ops_in_window, op_start_times, machine_avail)
-                    ops_in_window.sort(key=lambda x: result[x[0], x[1]])
-                    for job, op in ops_in_window:
-                        machine = jsp_instance["mch"][job][op]
-                        orders[machine].append((job, op))
-                assert all([len(o) == j for o in orders]), f"某台机器的操作数量不正确: {[len(o) for o in orders]} vs {j}"
-                # 实现根据orders更新op_start_times的逻辑，确保工件顺序约束和机器约束都得到满足
-                # 这里需要一个调度逻辑，按照orders中每台机器的操作顺序，计算每个操作的开始时间，并更新op_start_times
-                machine_ready = [0] * m
-                job_ready = [0] * j
-                order_idx = [0] * m  # 记录每台机器当前调度到哪个操作
-                scheduled_ops = set()
-                while len(scheduled_ops) < nopr:
-                    progress = False
-                    for machine in range(m):
-                        if order_idx[machine] >= len(orders[machine]):
-                            continue
-                        job, op = orders[machine][order_idx[machine]]
-                        if (job, op) in scheduled_ops:
-                            order_idx[machine] += 1
-                            continue
-                        # 检查工件前一个操作是否完成
-                        if op > 0 and (job, op-1) not in scheduled_ops:
-                            continue
-                        # 可以调度这个操作了
-                        start_time = max(job_ready[job], machine_ready[machine])
-                        op_start_times[job][op] = start_time
-                        end_time = start_time + duration[job][op]
-                        job_ready[job] = end_time
-                        machine_ready[machine] = end_time
-                        scheduled_ops.add((job, op))
-                        order_idx[machine] += 1
-                        progress = True
-                    if not progress:
-                        raise ValueError("调度过程中没有进展，可能是orders中的操作顺序不合理，导致死锁")
-                makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
-            elif debug == 'suffix_windows':
-                multi_ops_in_windows = []
-                multi_machine_avail = []
-                windows_data = []
-                start_idx = window_idx 
-                total_windows = (nopr - start_idx) // window_size
-                if total_windows == 0:
-                    # only one window
-                    multi_ops_in_windows.append(sorted_ops[start_idx:])
-                else:
-                    window_list = [sorted_ops[start_idx + i*window_size:start_idx + (i+1)*window_size] for i in range(0, total_windows)]
-                    multi_ops_in_windows.extend(window_list)
-                    if start_idx + total_windows * window_size < nopr:
-                        last_ops_in_window = sorted_ops[start_idx + total_windows * window_size:]
-                        multi_ops_in_windows.append(last_ops_in_window)
-                assert sum(len(w) for w in multi_ops_in_windows) == nopr - start_idx, f"多窗口划分错误，操作总数不匹配: {sum(len(w) for w in multi_ops_in_windows)} vs {nopr - start_idx}"
+            should_accept = True
 
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = get_machine_window_availability(
-                        ops_in_window, op_start_times, duration, jsp_instance["mch"]
-                    )
-                    multi_machine_avail.append(machine_avail)
-                orders = [[] for _ in range(m)]
-                # 对于前面的操作保证顺序不变，直接加入orders
-                for ops in sorted_ops[:start_idx]:
-                    job, op = ops
-                    machine = jsp_instance["mch"][job][op]
-                    orders[machine].append((job, op))
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = multi_machine_avail[i]
-                    # st = time()
-                    result = solve_window_with_machine_avail(jsp_instance, ops_in_window, op_start_times, machine_avail)
-                    # ed = time()
-                    # print(f"Window {i} solved in {ed - st:.2f} seconds")
-                    if result is None:
-                        ops_in_window.sort(key=lambda x: op_start_times[x[0]][x[1]])  # 按原始开始时间排序
-                    else:
-                        try:
-                            ops_in_window.sort(key=lambda x: result[(x[0], x[1])])
-                        except KeyError as e:
-                            print(e)
-                            print(result.keys())
-                            print(result.values())
-                            import sys
-                            sys.exit(0)
-                    for job, op in ops_in_window:
-                        machine = jsp_instance["mch"][job][op]
-                        orders[machine].append((job, op))
-                assert all([len(o) == j for o in orders]), f"某台机器的操作数量不正确: {[len(o) for o in orders]} vs {j}"
-                # import sys
-                # sys.exit(0)
-                # 实现根据orders更新op_start_times的逻辑，确保工件顺序约束和机器约束都得到满足
-                # 这里需要一个调度逻辑，按照orders中每台机器的操作顺序，计算每个操作的开始时间，并更新op_start_times
-                machine_ready = [0] * m
-                job_ready = [0] * j
-                order_idx = [0] * m  # 记录每台机器当前调度到哪个操作
-                scheduled_ops = set()
-                while len(scheduled_ops) < nopr:
-                    progress = False
-                    for machine in range(m):
-                        if order_idx[machine] >= len(orders[machine]):
-                            continue
-                        job, op = orders[machine][order_idx[machine]]
-                        if (job, op) in scheduled_ops:
-                            order_idx[machine] += 1
-                            continue
-                        # 检查工件前一个操作是否完成
-                        if op > 0 and (job, op-1) not in scheduled_ops:
-                            continue
-                        # 可以调度这个操作了
-                        start_time = max(job_ready[job], machine_ready[machine])
-                        op_start_times[job][op] = start_time
-                        end_time = start_time + duration[job][op]
-                        job_ready[job] = end_time
-                        machine_ready[machine] = end_time
-                        scheduled_ops.add((job, op))
-                        order_idx[machine] += 1
-                        progress = True
-                    if not progress:
-                        raise ValueError("调度过程中没有进展，可能是orders中的操作顺序不合理，导致死锁")
-                makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
-            elif debug == 'prefix_windows':
-                multi_ops_in_windows = []
-                multi_machine_avail = []
-                windows_data = []
-                start_idx = window_idx % window_size
-                total_windows = window_idx // window_size
-                multi_ops_in_windows.append(sorted_ops[0:start_idx])
-                if total_windows > 0:
-                    window_list = [sorted_ops[start_idx + i*window_size:start_idx + (i+1)*window_size] for i in range(0, total_windows)]
-                    multi_ops_in_windows.extend(window_list)
-                assert sum(len(w) for w in multi_ops_in_windows) == window_idx, f"多窗口划分错误，操作总数不匹配: {sum(len(w) for w in multi_ops_in_windows)} vs {window_idx}"
-
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = get_machine_window_availability(
-                        ops_in_window, op_start_times, duration, jsp_instance["mch"]
-                    )
-                    multi_machine_avail.append(machine_avail)
-                orders = [[] for _ in range(m)]
-                # 对于前面的操作保证顺序不变，直接加入orders
-                for i in range(len(multi_ops_in_windows)):
-                    ops_in_window = multi_ops_in_windows[i]
-                    machine_avail = multi_machine_avail[i]
-                    # st = time()
-                    result = solve_window_with_machine_avail(jsp_instance, ops_in_window, op_start_times, machine_avail)
-                    # ed = time()
-                    # print(f"Window {i} solved in {ed - st:.2f} seconds")
-                    ops_in_window.sort(key=lambda x: result[x[0], x[1]])
-                    for job, op in ops_in_window:
-                        machine = jsp_instance["mch"][job][op]
-                        orders[machine].append((job, op))
-                for ops in sorted_ops[window_idx:]:
-                    job, op = ops
-                    machine = jsp_instance["mch"][job][op]
-                    orders[machine].append((job, op))
-                assert all([len(o) == j for o in orders]), f"某台机器的操作数量不正确: {[len(o) for o in orders]} vs {j}"
-                # import sys
-                # sys.exit(0)
-                # 实现根据orders更新op_start_times的逻辑，确保工件顺序约束和机器约束都得到满足
-                # 这里需要一个调度逻辑，按照orders中每台机器的操作顺序，计算每个操作的开始时间，并更新op_start_times
-                machine_ready = [0] * m
-                job_ready = [0] * j
-                order_idx = [0] * m  # 记录每台机器当前调度到哪个操作
-                scheduled_ops = set()
-                while len(scheduled_ops) < nopr:
-                    progress = False
-                    for machine in range(m):
-                        if order_idx[machine] >= len(orders[machine]):
-                            continue
-                        job, op = orders[machine][order_idx[machine]]
-                        if (job, op) in scheduled_ops:
-                            order_idx[machine] += 1
-                            continue
-                        # 检查工件前一个操作是否完成
-                        if op > 0 and (job, op-1) not in scheduled_ops:
-                            continue
-                        # 可以调度这个操作了
-                        start_time = max(job_ready[job], machine_ready[machine])
-                        op_start_times[job][op] = start_time
-                        end_time = start_time + duration[job][op]
-                        job_ready[job] = end_time
-                        machine_ready[machine] = end_time
-                        scheduled_ops.add((job, op))
-                        order_idx[machine] += 1
-                        progress = True
-                    if not progress:
-                        raise ValueError("调度过程中没有进展，可能是orders中的操作顺序不合理，导致死锁")
-                makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
-            else:
-                total_windows = (nopr - window_idx) // window_size
-                machine_avail = get_machine_window_availability(
-                    ops_in_window, op_start_times, duration, jsp_instance["mch"]
-                )
-                # st = time()
-                window_result = solve_window_with_machine_avail(jsp_instance, 
-                                                                ops_in_window, 
-                                                                op_start_times, 
-                                                                machine_avail)
-                # ed = time()
-                # print(f"Window {window_idx} solved in {ed - st:.2f} seconds")
-                if not window_result:
-                    all_iterations.append(it)
-                    all_best_makespans.append(best_makespan)
-                    continue  # 优化失败，跳过
-
-                ref_start_times = [row[:] for row in op_start_times]
-                # print_window_machine_interval_comparison(
-                #     jsp_instance,
-                #     ops_in_window,
-                #     op_start_times,
-                #     machine_avail,
-                #     window_result,
-                #     window_idx,
-                #     it,
-                # )
-
-                # 更新窗口内操作的开始时间
-                original_max_time = 0
-                for (job, op), st in window_result.items():
-                    original_max_time = max(original_max_time, op_start_times[job][op] + duration[job][op])
-                    # print(f"For job ({job}, {op}), original start time: {op_start_times[job][op]}, new start time: {st}")
-                    op_start_times[job][op] = st
-
-                orders = [[] for _ in range(m)]
-                for machine in range(m):
-                    machine_ops = [
-                        (job, op)
-                        for job in range(j)
-                        for op in range(m)
-                        if jsp_instance["mch"][job][op] == machine
-                    ]
-                    machine_ops.sort(
-                        key=lambda item: (
-                            op_start_times[item[0]][item[1]],
-                            ref_start_times[item[0]][item[1]],
-                            item[0],
-                            item[1],
-                        )
-                    )
-                    orders[machine] = machine_ops
-
-                rebuilt_start_times = [[0] * m for _ in range(j)]
-                machine_ready = [0] * m
-                job_ready = [0] * j
-                order_idx = [0] * m
-                scheduled_ops = set()
-                while len(scheduled_ops) < nopr:
-                    progress = False
-                    for machine in range(m):
-                        if order_idx[machine] >= len(orders[machine]):
-                            continue
-                        job, op = orders[machine][order_idx[machine]]
-                        if (job, op) in scheduled_ops:
-                            order_idx[machine] += 1
-                            continue
-                        if op > 0 and (job, op - 1) not in scheduled_ops:
-                            continue
-
-                        start_time = max(job_ready[job], machine_ready[machine])
-                        rebuilt_start_times[job][op] = start_time
-                        end_time = start_time + duration[job][op]
-                        job_ready[job] = end_time
-                        machine_ready[machine] = end_time
-                        scheduled_ops.add((job, op))
-                        order_idx[machine] += 1
-                        progress = True
-                    if not progress:
-                        raise ValueError("调度过程中没有进展，可能是orders中的操作顺序不合理，导致死锁")
-
-                op_start_times = rebuilt_start_times
-                makespan = max(op_start_times[job][m-1] + duration[job][m-1] for job in range(j))
-            # print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
-        # print(f"Iteration {it}: Found better solution with makespan {makespan} (improvement: {(best_makespan - makespan) / best_makespan * 100:.2f}%)")
-        if makespan < best_makespan or True:
-            # Debug: 无脑接受新解，观察搜索过程中的解的变化情况
+        if should_accept:
             if makespan < best_makespan:
                 count += 1
                 makespan_update_iterations.append(it)
@@ -1125,8 +770,9 @@ def large_neiborhood_search(
             # DEBUG: 仅在特定实例上打印改进信息
             # print(f"Iteration {it}: Found better solution with makespan {best_makespan}")
             if debug == 'all_windows':
+                total_windows = (nopr - selected_window_idx) // window_size
                 print(f"Iteration {it}: Found better solution with makespan {best_makespan}, total windows is {total_windows}, "
-                      f"prefix windows is {window_idx // window_size}, suffix windows is {(nopr - window_idx) // window_size}")
+                      f"prefix windows is {selected_window_idx // window_size}, suffix windows is {(nopr - selected_window_idx) // window_size}")
             # 更新
             all_ops = [(job, op) for job in range(j) for op in range(m)]
             op_start_flat = {(job, op): op_start_times[job][op] for job, op in all_ops}
@@ -1640,34 +1286,19 @@ if __name__ == "__main__":
     # start_var = 1
     # end_var = len(dataset)
     count = 0
-    start_var = 72
-    end_var = 72
+    start_var = 21
+    end_var = 30
     for jsp_dataset in dataset:
         count += 1
         if not (count >= start_var and count <= end_var):
             continue
-        # debug
-        # # print("调度实例：", jsp_dataset["names"], "Jobs:", jsp_dataset["j"], "Machines:", jsp_dataset["m"])
-        # if jsp_dataset["names"].startswith("ta0") or jsp_dataset["names"].startswith("ta1") or jsp_dataset["names"].startswith("ta2") \
-        #     or jsp_dataset["names"].startswith("ta3") or jsp_dataset["names"].startswith("ta4") or jsp_dataset["names"].startswith("ta5") or jsp_dataset["names"].startswith("ta6") or jsp_dataset["names"].startswith("ta70"):
-        #     continue
-        # if jsp_dataset['names'].startswith("0") or jsp_dataset['names'].startswith("1") or jsp_dataset['names'].startswith("2") or jsp_dataset['names'].startswith("3"):
-        #     continue
-        window_size = min(120, jsp_dataset["j"] * jsp_dataset["m"])
+        window_size = min(150, jsp_dataset["j"] * jsp_dataset["m"])
         sols, ms, times = solve_instance(jsp_dataset, pdr=pdr)
         
         op_start_times = convert_solution_to_start_times(sols, jsp_dataset)
         assert ms == max(op_start_times[job][jsp_dataset["m"]-1] + jsp_dataset["duration"][job][jsp_dataset["m"]-1] for job in range(jsp_dataset["j"])), \
             f"计算的makespan {ms} 与根据op_start_times计算的makespan不一致 {max(op_start_times[job][jsp_dataset['m']-1] + jsp_dataset['duration'][job][jsp_dataset['m']-1] for job in range(jsp_dataset['j']))}"
         
-        # all_seq = [(job, op) for job in range(jsp_dataset["j"]) for op in range(jsp_dataset["m"])]
-        # original_debug_ops = [(job, op, op_start_times[job][op]) for job, op in all_seq]
-        # original_debug_ops.sort(key=lambda x: x[2]) # 按开始时间排序
-        # debug_seq = [(job, op) for job, op, st in original_debug_ops]
-        # debug_makespan, _ = compute_makespan_from_seq(jsp_dataset, debug_seq)
-        # assert debug_makespan == ms, f"在最开始获得解的过程中，从序列计算的makespan与直接计算的makespan不一致: {debug_makespan} vs {ms}，序列计算函数有问题"
-        
-        # op_start_times, ms = rolling_horizon_cp(jsp_dataset, window_size=window_size, roll_speed=10)
 
         best_known = _to_scalar_makespan(jsp_dataset.get("makespan"))
         restore_history = False
@@ -1685,11 +1316,11 @@ if __name__ == "__main__":
         step_action = None
         better_solution, better_makespan, search_history = large_neiborhood_search(jsp_dataset, 
                                                                                     op_start_times, 
-                                                                                    use_multi_window=False,
                                                                                     window_size=window_size, 
-                                                                                    max_iterations=200, 
+                                                                                    max_iterations=500, 
                                                                                     debug="single_windows",
                                                                                     cp_mode=False,
+                                                                                    neighborhood_mode="first_improve",
                                                                                     plot_improvements=False,
                                                                                     plot_dir=f"gantt_improvements_cp_ta{start_var}——test",
                                                                                     return_history=restore_history, 
