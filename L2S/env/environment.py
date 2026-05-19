@@ -16,7 +16,7 @@ import time
 import random
 from env.window_utils import (
     _available_nonzero_cpus,
-    _build_action_window_features,
+    _build_action_window_states,
     _init_worker_nonzero_cpu_affinity,
     _temporary_nonzero_cpu_affinity,
     _window_build_orders,
@@ -53,21 +53,12 @@ class BatchGraph:
         self.feasible_action_machine_feat = None
 
 
-def _apply_zero_improvement_penalty(reward, zero_improvement_penalty):
-    """Penalize no-improvement transitions with a fixed reward."""
-    zero_reward_mask = torch.isclose(reward, torch.zeros_like(reward))
-    if not torch.any(zero_reward_mask):
-        return reward
-    penalty = torch.full_like(reward, fill_value=zero_improvement_penalty)
-    return torch.where(zero_reward_mask, penalty, reward)
-
 class JsspWindow:
     def __init__(self, n_job, n_mch, low, high,
                  cp_solver_time=1,
                  cp_solver_cpu=1,
                  cpu_budget=16,
                  window_size=150,
-                 zero_improvement_penalty=-3.0,
                  fea_norm_const=1000,
                  evaluator_type='message-passing'):
         self.n_job = n_job
@@ -82,7 +73,6 @@ class JsspWindow:
         self.current_objs = None
         self.tabu_size = 1
         self.tabu_lists = None
-        self.zero_improvement_penalty = float(zero_improvement_penalty)
         self.fea_norm_const = fea_norm_const
         self.evaluator_type = evaluator_type
         self.eva = Evaluator() if evaluator_type == 'message-passing' else CPM_batch_G
@@ -98,6 +88,7 @@ class JsspWindow:
         self.current_adj_mats_mc = None
         self.current_adj_mats = None
         self.last_feasible_actions = None
+        self.last_window_states = None
 
     # Create the conjunctions adjacent matrix
     # Return: [batch, n_oprs+2, n_oprs+2]
@@ -164,7 +155,6 @@ class JsspWindow:
         for machine, machine_ops in enumerate(orders_by_machine):
             op_ids_on_mchs[machine, :len(machine_ops)] = machine_ops
         return op_ids_on_mchs
-
 
     def _rules_solver(self, args, plot=False):
         """Build an initial schedule from a dispatching rule."""
@@ -312,10 +302,12 @@ class JsspWindow:
         graph_mc = nx.from_numpy_array(adj_mat_mc, parallel_edges=False, create_using=nx.DiGraph)
         return graph, graph_mc
 
-    def _build_action_window_features(self, instance, start_times, actions, device):
-        return _build_action_window_features(
+    def _build_action_window_states(self, instance, start_times, orders, adj_mat_mc, actions, device):
+        return _build_action_window_states(
             instance=instance,
             start_times=start_times,
+            orders=orders,
+            adj_mat_mc=adj_mat_mc,
             actions=actions,
             n_job=self.n_job,
             n_mch=self.n_mch,
@@ -337,14 +329,12 @@ class JsspWindow:
         ]
         self.current_adj_mats = [self.adj_mat_pc + adj_mat_mc for adj_mat_mc in self.current_adj_mats_mc]
 
-    def _pack_state(self, x, edge_indices_pc, edge_indices_mc, batch, action_machine_feat, action_window_scalar):
+    def _pack_state(self, x, edge_indices_pc, edge_indices_mc, batch):
         return (
             x,
             edge_indices_pc,
             edge_indices_mc,
             batch,
-            action_machine_feat,
-            action_window_scalar,
         )
 
     def _parallel_config(self, task_count):
@@ -402,61 +392,83 @@ class JsspWindow:
         """
         if self.current_start_times is None or self.current_orders is None or self.current_adj_mats_mc is None:
             self._refresh_matrix_state()
-        tasks = [
-            (
-                idx,
-                instance,
-                np.array(self.current_start_times[idx], copy=True),
-                action,
-                self.n_job,
-                self.n_mch,
-                self.window_size,
-                self.cp_solver_time,
-                1,  # one sample occupies one CPU while batching across the environment
+
+        tasks = []
+        solved_payloads = []
+
+        for idx, (instance, action) in enumerate(zip(self.instances, actions)):
+            if action is None or int(action) <= 0:
+                solved_payloads.append({
+                    "index": idx,
+                    "applied": False,
+                })
+                continue
+
+            tasks.append(
+                (
+                    idx,
+                    instance,
+                    np.array(self.current_start_times[idx], copy=True),
+                    int(action),
+                    self.n_job,
+                    self.n_mch,
+                    self.window_size,
+                    self.cp_solver_time,
+                    1,
+                )
             )
-            for idx, (instance, action) in enumerate(zip(self.instances, actions))
-        ]
 
         worker_count, solver_cpu = self._parallel_config(len(tasks))
         tasks = [task[:-1] + (solver_cpu,) for task in tasks]
-        if worker_count <= 1:
-            solved_payloads = [_window_solve_single(task) for task in tasks]
+
+        if len(tasks) == 0:
+            pass
+        elif worker_count <= 1:
+            solved_payloads.extend([_window_solve_single(task) for task in tasks])
         else:
             ctx = mp.get_context("fork")
             with ctx.Pool(processes=worker_count, initializer=_init_worker_nonzero_cpu_affinity) as pool:
-                solved_payloads = pool.map(_window_solve_single, tasks)
+                solved_payloads.extend(pool.map(_window_solve_single, tasks))
+
         self._merge_parallel_results(solved_payloads, plot=plot)
 
     def step(self, actions, device, plot=False):
         """Apply a batch of actions, update graphs, and return the next state."""
         self.change_nxgraph_topology(actions, plot)
-        x, edge_indices_pc, edge_indices_mc, batch, makespan = self.dag2pyg(self.instances, self.sub_graphs_mc, device)
+
+        x, edge_indices_pc, edge_indices_mc, batch, makespan = self.dag2pyg(
+            self.instances, self.sub_graphs_mc, device
+        )
+
         reward = self.current_objs - makespan
         self.current_objs = makespan
 
         if self.tabu_size != 0:
             for i, action in enumerate(actions):
-                if action == 0:
+                if action is None or int(action) <= 0:
                     continue
                 if len(self.tabu_lists[i]) == self.tabu_size:
                     self.tabu_lists[i].pop(0)
-                self.tabu_lists[i].append(action)
+                self.tabu_lists[i].append(int(action))
 
         self.itr += 1
-        feasible_actions, flag, action_machine_feat = self.feasible_actions(device)
-        self.last_feasible_actions = feasible_actions
 
-        return self._pack_state(
+        feasible_actions, flag, batch_window_states = self.feasible_actions(device)
+        self.last_feasible_actions = feasible_actions
+        self.last_window_states = batch_window_states
+
+        state = self._pack_state(
             x,
             edge_indices_pc,
             edge_indices_mc,
             batch,
-            action_machine_feat,
-        ), reward, feasible_actions, ~flag
+        )
+        return state, batch_window_states, reward, feasible_actions, ~flag
 
     def reset(self, instances, init_type, device, plot=False):
         """Initialize one batch of instances and construct both graph and matrix views."""
         self.instances = instances
+
         if init_type == 'plist':
             plist = np.repeat(
                 np.random.permutation(np.arange(self.n_job).repeat(self.n_mch)).reshape(1, -1),
@@ -486,60 +498,67 @@ class JsspWindow:
         self.current_objs = make_span
         self.itr = 0
         self.tabu_lists = [[] for _ in range(instances.shape[0])]
+
         self._refresh_matrix_state()
 
-        feasible_actions, flag, action_machine_feat = self.feasible_actions(device)
+        feasible_actions, flag, batch_window_states = self.feasible_actions(device)
         self.last_feasible_actions = feasible_actions
+        self.last_window_states = batch_window_states
 
-        return self._pack_state(
+        state = self._pack_state(
             x,
             edge_indices_pc,
             edge_indices_mc,
             batch,
-            action_machine_feat,
-        ), feasible_actions, ~flag
+        )
 
+        return state, batch_window_states, feasible_actions, ~flag
+    
     def feasible_actions(self, device):
         """
-        Enumerate one candidate action list for each batch item and
-        build window features aligned with those actions.
+        Enumerate candidate actions for each batch item and build
+        local window states aligned with those actions.
 
         Returns
         -------
         actions : list[list[int]]
         feasible_actions_flag : torch.BoolTensor, shape [B, 1]
-        action_machine_feat : list[torch.Tensor]
-            each tensor has shape [A, n_mch, 9]
-        action_window_scalar : list[torch.Tensor]
-            each tensor has shape [A, 18]
+        batch_window_states : list[list[dict]]
+            batch_window_states[b][k] is the k-th candidate window dict
+            for batch item b.
         """
         actions = []
-        action_machine_feat = []
+        batch_window_states = []
         feasible_actions_flag = []
 
-        for G, instance, tabu_list, start_times in zip(
+        for G, instance, tabu_list, start_times, orders, adj_mat_mc in zip(
                 self.current_graphs,
                 self.instances,
                 self.tabu_lists,
-                self.current_start_times):
+                self.current_start_times,
+                self.current_orders,
+                self.current_adj_mats_mc):
 
-            action = self._gen_moves(solution=G, tabu_list=tabu_list)
+            candidate_actions = self._gen_moves(solution=G, tabu_list=tabu_list)
 
-            if len(action) != 0:
-                actions.append(action)
+            if len(candidate_actions) > 0:
+                actions.append(candidate_actions)
                 feasible_actions_flag.append(True)
+
+                window_states = self._build_action_window_states(
+                    instance=instance,
+                    start_times=start_times,
+                    orders=orders,
+                    adj_mat_mc=adj_mat_mc,
+                    actions=candidate_actions,
+                    device=device,
+                )
             else:
-                actions.append([0])
+                actions.append([])
                 feasible_actions_flag.append(False)
+                window_states = []
 
-            machine_feat = self._build_action_window_features(
-                instance=instance,
-                start_times=start_times,
-                actions=actions[-1],
-                device=device,
-            )
-
-            action_machine_feat.append(machine_feat)
+            batch_window_states.append(window_states)
 
         feasible_actions_flag = torch.tensor(
             feasible_actions_flag,
@@ -547,7 +566,7 @@ class JsspWindow:
             device=device
         ).unsqueeze(1)
 
-        return actions, feasible_actions_flag, action_machine_feat
+        return actions, feasible_actions_flag, batch_window_states
 
 if __name__ == '__main__':
     from generateJSP import uni_instance_gen

@@ -388,7 +388,7 @@ def _machine_ctx_to_tensor(machine_ctx, n_mch, makespan, device):
     return machine_tensor
 
 
-def _build_action_window_features(instance, 
+def _build_action_window_states(instance, 
                                   start_times, 
                                   actions, 
                                   n_job, 
