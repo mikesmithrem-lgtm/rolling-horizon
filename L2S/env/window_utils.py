@@ -44,7 +44,14 @@ def _init_worker_nonzero_cpu_affinity():
         os.sched_setaffinity(0, target_cpus)
 
 
-def _window_plan_nodes(op_start_times, n_job, n_mch, window_size, anchor_node, sorted_nodes=None, index_by_node=None):
+def _node_to_job_op(node, n_mch):
+    """Map 1-based operation node id to (job, op)."""
+    return divmod(int(node) - 1, n_mch)
+
+
+def _window_plan_nodes(op_start_times, 
+                       n_job, n_mch, window_size, 
+                       anchor_node, sorted_nodes=None, index_by_node=None):
     """Build a rolling window around the selected anchor node."""
     if sorted_nodes is None or index_by_node is None:
         sorted_nodes = list(range(1, n_job * n_mch + 1))
@@ -134,86 +141,6 @@ def _window_machine_availability(nodes_in_window, op_start_times, duration, mch,
         machine_avail[machine_idx] = (earliest, latest)
 
     return machine_avail
-
-
-def _window_machine_context(nodes_in_window, op_start_times, duration, mch, n_job, n_mch, machine_end, makespan):
-    """
-    Rich machine-level context for action/window features.
-
-    Returns:
-        machine_ctx[m] = {
-            "earliest": int,
-            "latest": int,
-            "span": int,
-            "load": float,
-            "slack": float,
-            "load_ratio": float,
-            "suffix": float,
-            "op_count": int,
-            "has_after": bool,
-        }
-    """
-    machine_ctx = {}
-    window_node_set = set(nodes_in_window)
-    total_window_ops = len(nodes_in_window)
-
-    for machine_idx in {
-        int(mch[(node - 1) // n_mch][(node - 1) % n_mch]) - 1 for node in nodes_in_window
-    }:
-        machine_nodes = [
-            job * n_mch + op + 1
-            for job in range(n_job)
-            for op in range(n_mch)
-            if int(mch[job][op]) - 1 == machine_idx
-        ]
-        machine_nodes.sort(
-            key=lambda node: (
-                op_start_times[(node - 1) // n_mch][(node - 1) % n_mch],
-                node,
-            )
-        )
-        idxs = [idx for idx, node in enumerate(machine_nodes) if node in window_node_set]
-        if not idxs:
-            continue
-
-        first_idx = idxs[0]
-        last_idx = idxs[-1]
-        machine_window_nodes = [machine_nodes[idx] for idx in idxs]
-
-        if first_idx > 0:
-            prev_job, prev_op = divmod(machine_nodes[first_idx - 1] - 1, n_mch)
-            earliest = int(op_start_times[prev_job][prev_op] + duration[prev_job][prev_op])
-        else:
-            earliest = 0
-
-        if last_idx < len(machine_nodes) - 1:
-            next_job, next_op = divmod(machine_nodes[last_idx + 1] - 1, n_mch)
-            latest = int(op_start_times[next_job][next_op])
-            has_after = True
-        else:
-            latest = int(makespan)
-            has_after = False
-
-        span = max(int(latest - earliest), 0)
-        load = float(sum(duration[(node - 1) // n_mch][(node - 1) % n_mch] for node in machine_window_nodes))
-        slack = max(float(span) - load, 0.0)
-        load_ratio = (load / float(span)) if span > 0 else 0.0
-        suffix = max(float(machine_end[machine_idx] - latest), 0.0)
-
-        machine_ctx[machine_idx] = {
-            "earliest": earliest,
-            "latest": latest,
-            "span": span,
-            "load": load,
-            "slack": slack,
-            "load_ratio": load_ratio,
-            "suffix": suffix,
-            "op_count": len(machine_window_nodes),
-            "has_after": has_after,
-            "op_ratio": float(len(machine_window_nodes)) / max(float(total_window_ops), 1.0),
-        }
-
-    return machine_ctx
 
 
 def _window_solve_subproblem(instance, n_job, n_mch, nodes_in_window, op_start_times, cp_solver_time, cp_solver_cpu):
@@ -358,81 +285,291 @@ def _window_build_adj_mat_mc(n_job, n_mch, orders):
     return np.transpose(adj_mat_mc)
 
 
-def _machine_ctx_to_tensor(machine_ctx, n_mch, makespan, device):
+def _compute_suffix_matrices(instance, op_end_times, job_end, machine_end, n_job, n_mch):
+    """Compute schedule-based suffix statistics for each operation."""
+    mch = np.asarray(instance[1], dtype=np.int32) - 1
+    job_suffix = np.zeros((n_job, n_mch), dtype=np.float32)
+    machine_suffix = np.zeros((n_job, n_mch), dtype=np.float32)
+
+    for j in range(n_job):
+        for o in range(n_mch):
+            m = int(mch[j, o])
+            job_suffix[j, o] = float(max(int(job_end[j]) - int(op_end_times[j, o]), 0))
+            machine_suffix[j, o] = float(max(int(machine_end[m]) - int(op_end_times[j, o]), 0))
+
+    return job_suffix, machine_suffix
+
+
+def _build_local_pc_edges(nodes_in_window, n_mch, local_idx_by_node, device):
+    """Build local precedence edges among window operations only."""
+    edges = []
+    window_node_set = set(nodes_in_window)
+
+    for node in nodes_in_window:
+        job, op = _node_to_job_op(node, n_mch)
+        if op > 0 and (node - 1) in window_node_set:
+            edges.append([local_idx_by_node[node - 1], local_idx_by_node[node]])
+
+    if len(edges) == 0:
+        return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+    return torch.tensor(edges, dtype=torch.long, device=device).t().contiguous()
+
+
+def _build_local_mc_edges(nodes_in_window, adj_mat_mc, device):
     """
-    Convert machine context to tensor [n_mch, 9]:
-        0: avail_start / C
-        1: avail_end / C
-        2: avail_span / C
-        3: window_load / C
-        4: machine_slack / C
-        5: load_ratio
+    Build local machine-order edges from the augmented global machine adjacency matrix.
+
+    adj_mat_mc is assumed to be the augmented matrix with indices aligned to node ids:
+    row = source node id, col = target node id.
+    """
+    if len(nodes_in_window) == 0:
+        return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+    nodes = np.asarray(nodes_in_window, dtype=np.int64)
+    sub_adj = np.asarray(adj_mat_mc[np.ix_(nodes, nodes)], dtype=np.int32)
+    rows, cols = np.nonzero(sub_adj)
+
+    if len(rows) == 0:
+        return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+    edge_index = np.stack([rows, cols], axis=0)
+    return torch.tensor(edge_index, dtype=torch.long, device=device).contiguous()
+
+
+def _extract_window_machine_info(
+    nodes_in_window,
+    orders,
+    start_times,
+    duration,
+    mch,
+    machine_end,
+    makespan,
+    n_mch,
+):
+    """
+    Build machine-level context for the current window.
+
+    Returns
+    -------
+    involved_machines : list[int]
+        global machine ids in ascending order
+    machine_feat : np.ndarray [Mw, 8]
+    node_to_local_machine : dict[node] -> local machine index
+    pos_on_machine_ratio : dict[node] -> float
+    """
+    window_node_set = set(nodes_in_window)
+    total_window_ops = max(len(nodes_in_window), 1)
+
+    involved_machines = sorted({
+        int(mch[(node - 1) // n_mch, (node - 1) % n_mch])
+        for node in nodes_in_window
+    })
+
+    global_m_to_local = {m: idx for idx, m in enumerate(involved_machines)}
+    node_to_local_machine = {}
+    pos_on_machine_ratio = {}
+    machine_feat = np.zeros((len(involved_machines), 8), dtype=np.float32)
+
+    for global_m in involved_machines:
+        local_m = global_m_to_local[global_m]
+        machine_nodes_full = orders[global_m]
+        idxs = [idx for idx, node in enumerate(machine_nodes_full) if node in window_node_set]
+        machine_window_nodes = [machine_nodes_full[idx] for idx in idxs]
+
+        if len(machine_window_nodes) == 0:
+            continue
+
+        first_idx = idxs[0]
+        last_idx = idxs[-1]
+
+        if first_idx > 0:
+            prev_node = machine_nodes_full[first_idx - 1]
+            pj, po = _node_to_job_op(prev_node, n_mch)
+            avail_start = int(start_times[pj, po] + duration[pj, po])
+        else:
+            avail_start = 0
+
+        if last_idx < len(machine_nodes_full) - 1:
+            next_node = machine_nodes_full[last_idx + 1]
+            nj, no = _node_to_job_op(next_node, n_mch)
+            avail_end = int(start_times[nj, no])
+        else:
+            avail_end = int(makespan)
+
+        avail_span = max(avail_end - avail_start, 0)
+        window_load = float(sum(duration[_node_to_job_op(node, n_mch)] for node in machine_window_nodes))
+        idle = max(float(avail_span) - window_load, 0.0)
+        load_ratio = (window_load / float(avail_span)) if avail_span > 0 else 0.0
+        idle_ratio = (idle / float(avail_span)) if avail_span > 0 else 0.0
+        suffix_load = max(float(machine_end[global_m] - avail_end), 0.0)
+        num_window_ops_ratio = float(len(machine_window_nodes)) / float(total_window_ops)
+
+        machine_feat[local_m, 0] = float(avail_start)
+        machine_feat[local_m, 1] = float(avail_end)
+        machine_feat[local_m, 2] = float(avail_span)
+        machine_feat[local_m, 3] = float(window_load)
+        machine_feat[local_m, 4] = float(load_ratio)
+        machine_feat[local_m, 5] = float(idle_ratio)
+        machine_feat[local_m, 6] = float(suffix_load)
+        machine_feat[local_m, 7] = float(num_window_ops_ratio)
+
+        denom = max(len(machine_window_nodes) - 1, 1)
+        for pos, node in enumerate(machine_window_nodes):
+            node_to_local_machine[node] = local_m
+            pos_on_machine_ratio[node] = float(pos) / float(denom) if len(machine_window_nodes) > 1 else 0.0
+
+    return involved_machines, machine_feat, node_to_local_machine, pos_on_machine_ratio
+
+
+def _build_op_features(
+    nodes_in_window,
+    anchor_node,
+    instance,
+    start_times,
+    op_end_times,
+    makespan,
+    job_suffix,
+    machine_suffix,
+    pos_on_machine_ratio,
+    n_job,
+    n_mch,
+):
+    """
+    Build operation features.
+
+    op_features shape = [K, 10]
+    dims:
+        0: proc_time / C
+        1: start_time / C
+        2: end_time / C
+        3: (start_time - window_start) / window_span
+        4: (end_time - window_start) / window_span
+        5: job_suffix / C
         6: machine_suffix / C
-        7: op_ratio
-        8: valid_mask
+        7: is_anchor
+        8: pos_in_job / max(n_mch - 1, 1)
+        9: pos_on_machine_in_window / max(num_ops_on_machine - 1, 1)
     """
-    denom = max(float(makespan), 1.0)
-    machine_tensor = torch.zeros((n_mch, 9), dtype=torch.float, device=device)
+    duration = np.asarray(instance[0], dtype=np.int32)
+    time_norm = max(float(makespan), 1.0)
 
-    for machine_idx, ctx in machine_ctx.items():
-        machine_tensor[machine_idx, 0] = float(ctx["earliest"]) / denom
-        machine_tensor[machine_idx, 1] = float(ctx["latest"]) / denom
-        machine_tensor[machine_idx, 2] = float(ctx["span"]) / denom
-        machine_tensor[machine_idx, 3] = float(ctx["load"]) / denom
-        machine_tensor[machine_idx, 4] = float(ctx["slack"]) / denom
-        machine_tensor[machine_idx, 5] = float(ctx["load_ratio"])
-        machine_tensor[machine_idx, 6] = float(ctx["suffix"]) / denom
-        machine_tensor[machine_idx, 7] = float(ctx["op_ratio"])
-        machine_tensor[machine_idx, 8] = 1.0
+    starts = [int(start_times[(node - 1) // n_mch, (node - 1) % n_mch]) for node in nodes_in_window]
+    ends = [int(op_end_times[(node - 1) // n_mch, (node - 1) % n_mch]) for node in nodes_in_window]
+    window_start = min(starts) if len(starts) > 0 else 0
+    window_end = max(ends) if len(ends) > 0 else window_start
+    window_span = max(float(window_end - window_start), 1.0)
 
-    return machine_tensor
+    op_feat = np.zeros((len(nodes_in_window), 10), dtype=np.float32)
+
+    for idx, node in enumerate(nodes_in_window):
+        j, o = _node_to_job_op(node, n_mch)
+        st = float(start_times[j, o])
+        et = float(op_end_times[j, o])
+        pt = float(duration[j, o])
+
+        op_feat[idx, 0] = pt / time_norm
+        op_feat[idx, 1] = st / time_norm
+        op_feat[idx, 2] = et / time_norm
+        op_feat[idx, 3] = (st - float(window_start)) / window_span
+        op_feat[idx, 4] = (et - float(window_start)) / window_span
+        op_feat[idx, 5] = float(job_suffix[j, o]) / time_norm
+        op_feat[idx, 6] = float(machine_suffix[j, o]) / time_norm
+        op_feat[idx, 7] = 1.0 if int(node) == int(anchor_node) else 0.0
+        op_feat[idx, 8] = float(o) / float(max(n_mch - 1, 1))
+        op_feat[idx, 9] = float(pos_on_machine_ratio.get(node, 0.0))
+
+    return op_feat
 
 
-def _build_action_window_states(instance, 
-                                  start_times, 
-                                  actions, 
-                                  n_job, 
-                                  n_mch, 
-                                  window_size,
-                                  fea_norm_const, 
-                                  device):
+def _normalize_machine_features(machine_feat, makespan):
+    """Normalize machine features to the actor-ready 8D tensor."""
+    time_norm = max(float(makespan), 1.0)
+    out = np.array(machine_feat, dtype=np.float32, copy=True)
+
+    if out.size == 0:
+        return out
+
+    out[:, 0] /= time_norm
+    out[:, 1] /= time_norm
+    out[:, 2] /= time_norm
+    out[:, 3] /= time_norm
+    out[:, 6] /= time_norm
+    return out
+
+
+def _build_action_window_states(
+    instance,
+    start_times,
+    orders,
+    adj_mat_mc,
+    actions,
+    n_job,
+    n_mch,
+    window_size,
+    fea_norm_const,
+    device,
+):
     """
-    Build rich window features for each feasible action.
+    Build window states for all feasible actions.
 
-    Returns:
-        action_machine_feat: [A, n_mch, 9]
-        action_window_scalar: [A, 18]
+    Parameters
+    ----------
+    instance : tuple/list
+        instance[0] = duration matrix [n_job, n_mch]
+        instance[1] = machine matrix [n_job, n_mch], 1-based machine ids
+    start_times : np.ndarray [n_job, n_mch]
+    orders : list[list[int]]
+        current per-machine operation orders
+    adj_mat_mc : np.ndarray [n_oprs+2, n_oprs+2]
+        augmented machine adjacency matrix
+    actions : list[int]
+        candidate anchor nodes
+    device : torch.device
+
+    Returns
+    -------
+    window_states : list[dict]
+        each dict contains:
+            action: int
+            anchor_local_idx: int
+            op_ids: LongTensor[K]
+            op_features: FloatTensor[K, 10]
+            mch_features: FloatTensor[Mw, 8]
+            op_machine_id: LongTensor[K]
+            edge_index_pc: LongTensor[2, E1]
+            edge_index_mc: LongTensor[2, E2]
     """
+    _ = fea_norm_const  # kept for interface compatibility
+
     if len(actions) == 0:
-        return (
-            torch.zeros((0, n_mch, 9), dtype=torch.float, device=device),
-            torch.zeros((0, 18), dtype=torch.float, device=device),
-        )
+        return []
+
+    duration = np.asarray(instance[0], dtype=np.int32)
+    mch = np.asarray(instance[1], dtype=np.int32) - 1
+    start_times = np.asarray(start_times, dtype=np.int32)
+
+    op_end_times, makespan, machine_end, job_end = _current_schedule_stats(
+        instance, start_times, n_job, n_mch
+    )
+    job_suffix, machine_suffix = _compute_suffix_matrices(
+        instance, op_end_times, job_end, machine_end, n_job, n_mch
+    )
 
     sorted_nodes = list(range(1, n_job * n_mch + 1))
     sorted_nodes.sort(
         key=lambda node: (
-            start_times[(node - 1) // n_mch][(node - 1) % n_mch],
-            node,
+            int(start_times[(node - 1) // n_mch, (node - 1) % n_mch]),
+            int(node),
         )
     )
     index_by_node = {node: idx for idx, node in enumerate(sorted_nodes)}
 
-    duration = instance[0]
-    mch = instance[1]
-    op_end_times, makespan, machine_end, job_end = _current_schedule_stats(
-        instance, start_times, n_job, n_mch
-    )
-
-    action_machine_feat = []
-    action_window_scalar = []
+    window_states = []
 
     for action in actions:
         anchor_node = int(action)
-
         if anchor_node <= 0 or anchor_node > n_job * n_mch:
-            action_machine_feat.append(torch.zeros((n_mch, 9), dtype=torch.float, device=device))
-            action_window_scalar.append(torch.zeros((18,), dtype=torch.float, device=device))
             continue
 
         nodes_in_window = _window_plan_nodes(
@@ -445,27 +582,68 @@ def _build_action_window_states(instance,
             index_by_node=index_by_node,
         )
 
-        machine_ctx = _window_machine_context(
+        if len(nodes_in_window) == 0:
+            continue
+
+        local_idx_by_node = {node: idx for idx, node in enumerate(nodes_in_window)}
+
+        _, machine_feat_raw, node_to_local_machine, pos_on_machine_ratio = _extract_window_machine_info(
             nodes_in_window=nodes_in_window,
-            op_start_times=start_times,
+            orders=orders,
+            start_times=start_times,
             duration=duration,
             mch=mch,
-            n_job=n_job,
-            n_mch=n_mch,
             machine_end=machine_end,
             makespan=makespan,
+            n_mch=n_mch,
         )
 
-        machine_tensor = _machine_ctx_to_tensor(
-            machine_ctx=machine_ctx,
-            n_mch=n_mch,
+        machine_feat = _normalize_machine_features(machine_feat_raw, makespan)
+        op_feat = _build_op_features(
+            nodes_in_window=nodes_in_window,
+            anchor_node=anchor_node,
+            instance=instance,
+            start_times=start_times,
+            op_end_times=op_end_times,
             makespan=makespan,
+            job_suffix=job_suffix,
+            machine_suffix=machine_suffix,
+            pos_on_machine_ratio=pos_on_machine_ratio,
+            n_job=n_job,
+            n_mch=n_mch,
+        )
+
+        op_machine_id = np.array(
+            [node_to_local_machine[node] for node in nodes_in_window],
+            dtype=np.int64,
+        )
+
+        edge_index_pc = _build_local_pc_edges(
+            nodes_in_window=nodes_in_window,
+            n_mch=n_mch,
+            local_idx_by_node=local_idx_by_node,
+            device=device,
+        )
+        edge_index_mc = _build_local_mc_edges(
+            nodes_in_window=nodes_in_window,
+            adj_mat_mc=adj_mat_mc,
             device=device,
         )
 
-        action_machine_feat.append(machine_tensor)
+        window_state = {
+            "action": anchor_node,
+            "anchor_local_idx": int(local_idx_by_node[anchor_node]),
+            "op_ids": torch.tensor(nodes_in_window, dtype=torch.long, device=device),
+            "op_features": torch.tensor(op_feat, dtype=torch.float, device=device),
+            "mch_features": torch.tensor(machine_feat, dtype=torch.float, device=device),
+            "op_machine_id": torch.tensor(op_machine_id, dtype=torch.long, device=device),
+            "edge_index_pc": edge_index_pc,
+            "edge_index_mc": edge_index_mc,
+        }
+        assert window_state["op_ids"][window_state["anchor_local_idx"]].item() == action
+        window_states.append(window_state)
 
-    return torch.stack(action_machine_feat, dim=0)
+    return window_states
 
 
 def _window_solve_single(args):

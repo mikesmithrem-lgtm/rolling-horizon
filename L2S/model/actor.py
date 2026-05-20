@@ -201,22 +201,24 @@ class WindowEncoder(nn.Module):
         )
 
     def _pool_mean(self, x, group_idx, num_groups):
-        device = x.device
-        out = torch.zeros(num_groups, x.size(-1), device=device)
-        cnt = torch.zeros(num_groups, 1, device=device)
-        out.index_add_(0, group_idx, x)
-        ones = torch.ones(group_idx.size(0), 1, device=device)
-        cnt.index_add_(0, group_idx, ones)
+        out = torch.zeros(num_groups, x.size(-1), device=x.device, dtype=x.dtype)
+        cnt = torch.zeros(num_groups, 1, device=x.device, dtype=x.dtype)
+
+        out = out.index_add(0, group_idx, x)
+        ones = torch.ones(group_idx.size(0), 1, device=x.device, dtype=x.dtype)
+        cnt = cnt.index_add(0, group_idx, ones)
+
         return out / cnt.clamp(min=1.0)
 
     def _pool_max(self, x, group_idx, num_groups):
-        device = x.device
-        out = torch.full((num_groups, x.size(-1)), -1e9, device=device)
-        for i in range(x.size(0)):
-            g = group_idx[i].item()
-            out[g] = torch.maximum(out[g], x[i])
-        out[out < -1e8] = 0.0
-        return out
+        outs = []
+        for g in range(num_groups):
+            mask = (group_idx == g)
+            if mask.any():
+                outs.append(x[mask].max(dim=0).values)
+            else:
+                outs.append(torch.zeros(x.size(-1), device=x.device, dtype=x.dtype))
+        return torch.stack(outs, dim=0)
 
     def forward(self, global_op_embed, window_state):
         """
@@ -388,9 +390,11 @@ class Actor(nn.Module):
         log_prob = torch.stack(log_probs, dim=0).unsqueeze(-1)
         return sampled_actions, log_prob
 
-if __name__ == '__main__':
+def test_pineline():
     import random
     from env.environment import JsspWindow, BatchGraph
+    from env.generateJSP import uni_instance_gen
+    from types import SimpleNamespace
 
     def _bind_main_process_away_from_cpu0():
         if not hasattr(os, 'sched_getaffinity') or not hasattr(os, 'sched_setaffinity'):
@@ -402,27 +406,261 @@ if __name__ == '__main__':
         return set(os.sched_getaffinity(0))
 
     affinity = _bind_main_process_away_from_cpu0()
-    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    n_j = 20
-    n_m = 15
-    l = 1
-    h = 99
-    hid_dim = 128
+    n_job, n_mch = 10, 10
+    low, high = 1, 99
+    num_instances = 2
 
-    torch.manual_seed(1)
-    torch.cuda.manual_seed(1)
-    np.random.seed(1)
-    random.seed(1)
+    env = JsspWindow(
+        n_job=n_job,
+        n_mch=n_mch,
+        low=low,
+        high=high,
+        cp_solver_time=1,
+        cp_solver_cpu=1,
+        cpu_budget=1,
+        window_size=70,
+    )
+
+    instances = np.array([
+        uni_instance_gen(n_job, n_mch, low, high)
+        for _ in range(num_instances)
+    ])
+
+    states, batch_window_states, feasible_actions, done = env.reset(
+        instances,
+        init_type="spt-pdr",
+        device=device,
+        plot=False,
+    )
+
+    x, edge_index_pc, edge_index_mc, batch = states
+
+    print("==== Global state ====")
+    print("x.shape =", x.shape)
+    print("edge_index_pc.shape =", edge_index_pc.shape)
+    print("edge_index_mc.shape =", edge_index_mc.shape)
+    print("batch.shape =", batch.shape)
+
+    print("\n==== Local window states ====")
+    print("batch size =", len(batch_window_states))
+    print("num feasible actions =", len(feasible_actions[0]))
+    print("done =", done)
+
+    # 打印一个 candidate 看结构是否正确
+    first_candidate = batch_window_states[0][0]
+    print("\nOne candidate keys:", first_candidate.keys())
+    for k, v in first_candidate.items():
+        if torch.is_tensor(v):
+            print(k, v.shape, v.dtype)
+        else:
+            print(k, type(v), v)
+
+    # 先构造成 actor 现在习惯的 batch_states 形式
+    batch_states = SimpleNamespace(
+        x=x,
+        edge_index_pc=edge_index_pc,
+        edge_index_mc=edge_index_mc,
+        batch=batch,
+    )
+
+    # 这里的输入维度你要按你实际 actor 定义改
+    actor = Actor(
+        in_dim=x.size(-1),              # 全局节点特征维度
+        hidden_dim=128,
+        window_op_in_dim=10,            # 你前面定的是 10
+        window_mch_in_dim=8,            # 你前面定的是 8
+        embedding_l=4,
+        policy_l=3,
+        heads=4,
+        dropout=0.0,                    # 测试时先关掉高 dropout
+    ).to(device)
+
+    actor.eval()
+
+    with torch.no_grad():
+        sampled_actions, log_prob = actor(
+            batch_states=batch_states,
+            batch_window_states=batch_window_states,
+            feasible_actions=feasible_actions,
+        )
+
+    print("\n==== Actor output ====")
+    print("sampled_actions =", sampled_actions)
+    print("log_prob.shape =", log_prob.shape)
+    print("log_prob =", log_prob)
+
+    # 检查 sampled action 是否合法
+    for i, a in enumerate(sampled_actions):
+        assert a in feasible_actions[i], f"sampled action {a} not in feasible_actions[{i}]"
+
+    print("\nActor forward smoke test passed.")
+
+    # 再做一步环境交互测试
+    next_states, next_batch_window_states, reward, next_feasible_actions, next_done = env.step(
+        sampled_actions,
+        device=device,
+        plot=False,
+    )
+
+    print("\n==== Env step after actor ====")
+    print("reward =", reward)
+    print("next done =", next_done)
+    print("next feasible num =", len(next_feasible_actions[0]))
+
+    print("\nActor + Env interaction test passed.")
+
+    actor.train()
+    torch.autograd.set_detect_anomaly(True)
+    sampled_actions, log_prob = actor(
+        batch_states=batch_states,
+        batch_window_states=batch_window_states,
+        feasible_actions=feasible_actions,
+    )
+    loss = -log_prob.mean()
+    loss.backward()
+    print("backward passed.")
+
+
+if __name__ == "__main__":
+    import random
+    from env.environment import JsspWindow, BatchGraph
+    from env.generateJSP import uni_instance_gen
+    from types import SimpleNamespace
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    n_job, n_mch = 10, 10
+    low, high = 1, 99
+    num_instances = 6
+
+    env = JsspWindow(
+        n_job=n_job,
+        n_mch=n_mch,
+        low=low,
+        high=high,
+        cp_solver_time=1,
+        cp_solver_cpu=1,
+        cpu_budget=1,
+        window_size=70,
+    )
+
+    instances = np.array([
+        uni_instance_gen(n_job, n_mch, low, high)
+        for _ in range(num_instances)
+    ])
+
+    states, batch_window_states, feasible_actions, done = env.reset(
+        instances,
+        init_type="spt-pdr",
+        device=device,
+        plot=False,
+    )
+
+    x, edge_index_pc, edge_index_mc, batch = states
+
+    print("==== Global state ====")
+    print("x.shape =", x.shape)
+    print("edge_index_pc.shape =", edge_index_pc.shape)
+    print("edge_index_mc.shape =", edge_index_mc.shape)
+    print("batch.shape =", batch.shape)
+
+    print("\n==== Batch local windows ====")
+    print("batch size =", len(batch_window_states))
+    print("feasible lens =", [len(a) for a in feasible_actions])
+    print("done =", done.squeeze(-1).tolist())
+
+    assert len(batch_window_states) == num_instances
+    assert len(feasible_actions) == num_instances
+    assert done.shape[0] == num_instances
+
+    for b in range(num_instances):
+        assert len(batch_window_states[b]) == len(feasible_actions[b])
+        for ws in batch_window_states[b]:
+            assert ws["op_features"].shape[0] == ws["op_ids"].shape[0]
+            assert ws["op_machine_id"].shape[0] == ws["op_ids"].shape[0]
+            assert ws["op_features"].shape[1] == 10
+            assert ws["mch_features"].shape[1] == 8
+
+    batch_states = SimpleNamespace(
+        x=x,
+        edge_index_pc=edge_index_pc,
+        edge_index_mc=edge_index_mc,
+        batch=batch,
+    )
 
     actor = Actor(
-        in_dim=3,
-        hidden_dim=hid_dim,
+        in_dim=x.size(-1),
+        hidden_dim=128,
+        window_op_in_dim=10,
+        window_mch_in_dim=8,
         embedding_l=4,
-        policy_l=4,
-        embedding_type='gin+dghan',
-        heads=1,
-        dropout=0.0
-    ).to(dev)
+        policy_l=3,
+        heads=4,
+        dropout=0.0,
+    ).to(device)
 
-    print(actor)
+    actor.train()
+
+    sampled_actions, log_prob = actor(
+        batch_states=batch_states,
+        batch_window_states=batch_window_states,
+        feasible_actions=feasible_actions,
+    )
+
+    print("\n==== Actor output ====")
+    print("sampled_actions =", sampled_actions)
+    print("log_prob.shape =", log_prob.shape)
+
+    assert len(sampled_actions) == num_instances
+    assert log_prob.shape == (num_instances, 1)
+
+    for b in range(num_instances):
+        assert sampled_actions[b] in feasible_actions[b], \
+            f"sampled action {sampled_actions[b]} not in feasible_actions[{b}]"
+
+    next_states, next_batch_window_states, reward, next_feasible_actions, next_done = env.step(
+        sampled_actions,
+        device=device,
+        plot=False,
+    )
+
+    print("\n==== Env step ====")
+    print("reward.shape =", reward.shape)
+    print("next feasible lens =", [len(a) for a in next_feasible_actions])
+
+    loss = -log_prob.mean()
+    actor.zero_grad(set_to_none=True)
+    loss.backward()
+
+    grad_none = []
+    for name, p in actor.named_parameters():
+        if p.requires_grad and p.grad is None:
+            grad_none.append(name)
+
+    print("\n==== Backward ====")
+    print("loss =", loss.item())
+    print("params without grad =", grad_none)
+
+    print("\nBatch smoke test passed.")
+
+    for t in range(10):
+        sampled_actions, log_prob = actor(
+            batch_states=batch_states,
+            batch_window_states=batch_window_states,
+            feasible_actions=feasible_actions,
+        )
+        states, batch_window_states, reward, feasible_actions, done = env.step(
+            sampled_actions,
+            device=device,
+            plot=False,
+        )
+        loss = -log_prob.mean()
+        actor.zero_grad(set_to_none=True)
+        loss.backward()
+
+

@@ -542,9 +542,6 @@ class JsspWindow:
             candidate_actions = self._gen_moves(solution=G, tabu_list=tabu_list)
 
             if len(candidate_actions) > 0:
-                actions.append(candidate_actions)
-                feasible_actions_flag.append(True)
-
                 window_states = self._build_action_window_states(
                     instance=instance,
                     start_times=start_times,
@@ -553,6 +550,20 @@ class JsspWindow:
                     actions=candidate_actions,
                     device=device,
                 )
+                current_state_ops = None
+                for idx, state in enumerate(window_states):
+                    if current_state_ops is None:
+                        current_state_ops = state['op_ids']
+                    else:
+                        if torch.equal(state['op_ids'], current_state_ops):
+                            break
+                        else:
+                            current_state_ops = state['op_ids']
+                window_states = window_states[:idx]
+                candidate_actions = candidate_actions[:idx]
+                actions.append(candidate_actions)
+                feasible_actions_flag.append(True)
+
             else:
                 actions.append([])
                 feasible_actions_flag.append(False)
@@ -706,15 +717,17 @@ if __name__ == '__main__':
                             f"Not Enough For Generating Solutions")
     n_job, n_mch = 10, 10
     low, high = 1, 99
-    num_instances = 4
-    env = JsspWindow(n_job, n_mch, low, high, cp_solver_time=1, cp_solver_cpu=1, cpu_budget=1, window_size=60)
+    num_instances = 1
+    env = JsspWindow(n_job, n_mch, low, high, cp_solver_time=1, cp_solver_cpu=1, cpu_budget=1, window_size=70)
     instances = [uni_instance_gen(n_job, n_mch, low, high) for _ in range(num_instances)]
     for instance in instances:
         job_data = np.stack((instance[1], instance[0]), axis=-1)
         output, makespan = jobshop_with_maintenance(job_data)
         print(f"Instance makespan: {makespan}")
     instances = np.array(instances)
-    states, feasible_actions, done = env.reset(instances, init_type='spt-pdr', device='cpu', plot=False)
+    states, batch_window_states, feasible_actions, done = env.reset(instances, init_type='spt-pdr', device='cpu', plot=False)
     for _ in range(50):
         actions = [random.choice(action) for action in feasible_actions]
-        states, reward, feasible_actions, done = env.step(actions, device='cpu', plot=False)
+        states, batch_window_states, reward, feasible_actions, done = env.step(actions, device='cpu', plot=False)
+        # print(f"Reward: {reward.item()}")
+    print(env.current_objs.item())
