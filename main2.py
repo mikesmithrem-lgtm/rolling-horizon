@@ -696,7 +696,7 @@ def large_neiborhood_search(
         op_start_times = candidate_start_times
         makespan = candidate_makespan
         should_accept = False
-        if neighborhood_mode in {"best_improve", "first_improve"}:
+        if neighborhood_mode in {"best_improve", "first_improve", "random"}:
             should_accept = makespan < best_makespan or force_restart_accept
         else:
             should_accept = True
@@ -1287,7 +1287,7 @@ if __name__ == "__main__":
     # end_var = len(dataset)
     count = 0
     start_var = 21
-    end_var = 30
+    end_var = 21
     for jsp_dataset in dataset:
         count += 1
         if not (count >= start_var and count <= end_var):
@@ -1320,7 +1320,7 @@ if __name__ == "__main__":
                                                                                     max_iterations=500, 
                                                                                     debug="single_windows",
                                                                                     cp_mode=False,
-                                                                                    neighborhood_mode="first_improve",
+                                                                                    neighborhood_mode="random",
                                                                                     plot_improvements=False,
                                                                                     plot_dir=f"gantt_improvements_cp_ta{start_var}——test",
                                                                                     return_history=restore_history, 

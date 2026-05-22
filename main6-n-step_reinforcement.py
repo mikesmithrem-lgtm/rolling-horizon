@@ -45,7 +45,7 @@ class RL2SCPJSSP:
         self.cp_solver_time = getattr(args, 'cp_solver_time', 1)
         self.cp_solver_cpu = getattr(args, 'cp_solver_cpu', 1)
         self.cpu_budget = getattr(args, 'cpu_budget', 16)
-        self.tensorboard_root = Path(getattr(args, 'tensorboard_log_dir', './runs'))
+        self.tensorboard_root = Path(getattr(args, 'tensorboard_log_dir', './tensorboard_log'))
         self.training_env_log_path = getattr(args, 'window_training_log_path', None)
         self.validation_env_log_path = getattr(args, 'window_validation_log_path', None)
 
@@ -156,7 +156,9 @@ class RL2SCPJSSP:
 
         return rewards_buffer, log_probs_buffer, dones_buffer
 
-    def learn(self, rewards, log_probs, dones, optimizer):
+    def learn(self, rewards, log_probs, dones, 
+              # time_weights, 
+              optimizer):
         R = torch.zeros_like(rewards[0], dtype=torch.float, device=rewards[0].device)
         returns = []
         for r in rewards[::-1]:
@@ -165,12 +167,14 @@ class RL2SCPJSSP:
         returns = torch.cat(returns, dim=-1)
         dones = torch.cat(dones, dim=-1)
         log_probs = torch.cat(log_probs, dim=-1)
+        # time_weights = torch.cat(time_weights, dim=-1)
 
         losses = []
         for b in range(returns.shape[0]):
             masked_R = torch.masked_select(returns[b], ~dones[b])
             masked_R = (masked_R - masked_R.mean()) / (torch.std(masked_R, unbiased=False) + self.eps)
             masked_log_prob = torch.masked_select(log_probs[b], ~dones[b])
+            # masked_time_weight = torch.masked_select(time_weights[b], ~dones[b]) 
             loss = (- masked_log_prob * masked_R).sum()
             losses.append(loss)
 
@@ -296,6 +300,7 @@ class RL2SCPJSSP:
                 rewards_buffer = []
                 log_probs_buffer = []
                 dones_buffer = [dones]
+                time_weight_buffer = []
 
                 policy.train()
 
@@ -312,23 +317,31 @@ class RL2SCPJSSP:
                         dev
                     )
 
+                    progress = self.env_training.itr / max(args.transit - 1, 1)   # 0 ~ 1
+                    # time_coef = 1.0 + args.time_weight_beta * progress            # 例如 beta=1.0，则权重 1~2
+                    # time_coef_tensor = torch.full_like(rewards, fill_value=time_coef, dtype=torch.float)
+
                     reward_mean = rewards.mean().item()
                     current_obj_mean = self.env_training.current_objs.mean().item()
+                    #time_coef_tensor_mean = time_coef_tensor.mean().item()
 
                     epoch_reward_log.append(reward_mean)
                     writer.add_scalar('train/reward_step', reward_mean, train_step)
                     writer.add_scalar('train/current_obj_step', current_obj_mean, train_step)
+                    # writer.add_scalar('train/time_coef_step', time_coef_tensor_mean, train_step)
                     train_step += 1
 
                     rewards_buffer.append(rewards)
                     log_probs_buffer.append(log_ps)
                     dones_buffer.append(dones)
+                    # time_weight_buffer.append(time_coef_tensor)
 
                     if self.env_training.itr % args.steps_learn == 0:
                         loss_value = self.learn(
                             rewards_buffer,
                             log_probs_buffer,
                             dones_buffer[:-1],
+                            # time_weight_buffer, 
                             optimizer
                         )
                         epoch_loss_log.append(loss_value)
@@ -338,6 +351,7 @@ class RL2SCPJSSP:
                         rewards_buffer = []
                         log_probs_buffer = []
                         dones_buffer = [dones]
+                        time_weight_buffer = []
 
                 # 补上最后一个未满 steps_learn 的尾块
                 if len(rewards_buffer) > 0:

@@ -16,11 +16,11 @@ parser.add_argument('--heads', type=int, default=1)  # dghan parameters
 parser.add_argument('--drop_out', type=float, default=0.1)  # dghan parameters
 # training parameters
 parser.add_argument('--lr', type=float, default=5e-5)
-parser.add_argument('--steps_learn', type=int, default=10)
-parser.add_argument('--transit', type=int, default=50)
-parser.add_argument('--batch_size', type=int, default=32)
+parser.add_argument('--steps_learn', type=int, default=25)
+parser.add_argument('--transit', type=int, default=500)
+parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--episodes', type=int, default=1)
-parser.add_argument('--step_validation', type=int, default=10)
+parser.add_argument('--step_validation', type=int, default=25)
 
 # new parameters for cp
 parser.add_argument('--training_set_size', type=int, default=25600)

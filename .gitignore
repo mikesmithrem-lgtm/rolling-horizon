@@ -1,3 +1,7 @@
 gantt*/
 log
 runs
+tensorboard_log
+*/__pycache__/
+*.pyc
+L2S/training_data/

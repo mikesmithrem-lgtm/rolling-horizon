@@ -440,7 +440,7 @@ class JsspWindow:
             self.instances, self.sub_graphs_mc, device
         )
 
-        reward = self.current_objs - makespan
+        reward = (self.current_objs - makespan) / self.current_objs
         self.current_objs = makespan
 
         if self.tabu_size != 0:
