@@ -696,7 +696,7 @@ def large_neiborhood_search(
         op_start_times = candidate_start_times
         makespan = candidate_makespan
         should_accept = False
-        if neighborhood_mode in {"best_improve", "first_improve", "random"}:
+        if neighborhood_mode in {"best_improve", "first_improve"}:
             should_accept = makespan < best_makespan or force_restart_accept
         else:
             should_accept = True

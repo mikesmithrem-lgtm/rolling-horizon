@@ -188,6 +188,8 @@ class RL2SCPJSSP:
         validation_start = time.time()
         policy.eval()
 
+        val_transit = args.validation_transit if args.validation_transit > 0 else args.transit
+
         with torch.no_grad():
             states_val, batch_window_states_val, feasible_actions_val, _ = self.env_validation.reset(
                 instances=self.validation_data,
@@ -195,7 +197,7 @@ class RL2SCPJSSP:
                 device=dev,
             )
 
-            while self.env_validation.itr < args.transit:
+            while self.env_validation.itr < val_transit:
                 actions_val, _ = self._policy_act(
                     policy,
                     states_val,

@@ -2,6 +2,9 @@ gantt*/
 log
 runs
 tensorboard_log
+tensorboard_log_ppo
+training_logs
 */__pycache__/
 *.pyc
 L2S/training_data/
+L2S_PPO/training_data/

@@ -11,6 +11,7 @@ from torch.distributions.categorical import Categorical
 from torch.nn import Sequential, Linear, ReLU
 from torch_geometric.nn import GINConv, GATConv, global_mean_pool
 from torch_geometric.utils import add_self_loops
+from torch_scatter import scatter_mean, scatter_max
 
 
 class DGHANlayer(torch.nn.Module):
@@ -259,6 +260,57 @@ class WindowEncoder(nn.Module):
 
         action_h = self.readout(torch.cat([anchor_h, op_mean, op_max, mch_mean, mch_max], dim=-1))
         return action_h
+
+    def forward_batched(self,
+                        op_global,
+                        op_features,
+                        mch_features,
+                        op_machine_id,
+                        op_window_id,
+                        mch_window_id,
+                        anchor_global_idx,
+                        edge_index_pc,
+                        edge_index_mc,
+                        num_windows):
+        """
+        Vectorized encoding for all candidate windows of a whole batch at once.
+
+        Shapes (sumK = total ops across all windows in this call,
+                sumM = total machine slots, W = num_windows):
+            op_global         : [sumK, Dg]
+            op_features       : [sumK, Fo]
+            mch_features      : [sumM, Fm]
+            op_machine_id     : [sumK]      indices into [0, sumM) (already offset)
+            op_window_id      : [sumK]      indices into [0, W)
+            mch_window_id     : [sumM]      indices into [0, W)
+            anchor_global_idx : [W]         indices into [0, sumK)
+            edge_index_pc/mc  : [2, E]      local op ids already offset
+        """
+        op_local = self.op_embedding(op_features)
+        mch_local = self.mch_embedding(mch_features)
+
+        op_machine_ctx = mch_local[op_machine_id]
+        op_h = self.op_init(torch.cat([op_global, op_local, op_machine_ctx], dim=-1))
+
+        num_mch = mch_local.size(0)
+        mch_mean = scatter_mean(op_h, op_machine_id, dim=0, dim_size=num_mch)
+        mch_max, _ = scatter_max(op_h, op_machine_id, dim=0, dim_size=num_mch)
+
+        mch_h = self.mch_update(torch.cat([mch_local, mch_mean, mch_max], dim=-1))
+        op_h = self.op_mch_fuse(torch.cat([op_h, mch_h[op_machine_id]], dim=-1))
+
+        for encoder in self.local_encoders:
+            op_h = encoder(op_h, edge_index_pc, edge_index_mc)
+
+        anchor_h = op_h[anchor_global_idx]                                   # [W, H]
+        op_mean_w = scatter_mean(op_h, op_window_id, dim=0, dim_size=num_windows)
+        op_max_w, _ = scatter_max(op_h, op_window_id, dim=0, dim_size=num_windows)
+        mch_mean_w = scatter_mean(mch_h, mch_window_id, dim=0, dim_size=num_windows)
+        mch_max_w, _ = scatter_max(mch_h, mch_window_id, dim=0, dim_size=num_windows)
+
+        return self.readout(torch.cat(
+            [anchor_h, op_mean_w, op_max_w, mch_mean_w, mch_max_w], dim=-1
+        ))
     
 
 class Actor(nn.Module):
@@ -354,38 +406,94 @@ class Actor(nn.Module):
         global_op_embed = torch.cat([node_embed, graph_embed_expand], dim=-1) # [B*N, 4H]
         global_op_embed = global_op_embed.reshape(batch_size, n_nodes_per_state, -1)
 
-        # ===== 2) candidate scoring =====
-        sampled_actions = []
-        log_probs = []
+        # ===== 2) candidate scoring (vectorized across the whole batch) =====
+        device = batch_states.x.device
+
+        owner_per_window = []        # b for each window
+        action_per_window = []       # anchor node id for each window
+        candidates_per_batch = [[] for _ in range(batch_size)]
+
+        op_features_list = []
+        mch_features_list = []
+        op_global_list = []
+        op_machine_id_list = []
+        op_window_id_list = []
+        mch_window_id_list = []
+        anchor_global_idx_list = []
+        edges_pc_list = []
+        edges_mc_list = []
+
+        op_offset = 0
+        mch_offset = 0
+
+        for b, candidate_windows in enumerate(batch_window_states):
+            for ws in candidate_windows:
+                K = ws["op_features"].size(0)
+                M = ws["mch_features"].size(0)
+                w_id = len(owner_per_window)
+
+                op_features_list.append(ws["op_features"])
+                mch_features_list.append(ws["mch_features"])
+                op_global_list.append(global_op_embed[b].index_select(0, ws["op_ids"]))
+                op_machine_id_list.append(ws["op_machine_id"] + mch_offset)
+                op_window_id_list.append(torch.full((K,), w_id, dtype=torch.long, device=device))
+                mch_window_id_list.append(torch.full((M,), w_id, dtype=torch.long, device=device))
+                anchor_global_idx_list.append(op_offset + int(ws["anchor_local_idx"]))
+                edges_pc_list.append(ws["edge_index_pc"] + op_offset)
+                edges_mc_list.append(ws["edge_index_mc"] + op_offset)
+
+                owner_per_window.append(b)
+                action_per_window.append(int(ws["action"]))
+                candidates_per_batch[b].append(w_id)
+
+                op_offset += K
+                mch_offset += M
+
+        num_windows = len(owner_per_window)
+
+        sampled_actions = [0] * batch_size
+        log_probs = [torch.zeros((), device=device) for _ in range(batch_size)]
+
+        if num_windows == 0:
+            log_prob = torch.stack(log_probs, dim=0).unsqueeze(-1)
+            return sampled_actions, log_prob
+
+        op_features_cat = torch.cat(op_features_list, dim=0)
+        mch_features_cat = torch.cat(mch_features_list, dim=0)
+        op_global_cat = torch.cat(op_global_list, dim=0)
+        op_machine_id_cat = torch.cat(op_machine_id_list, dim=0)
+        op_window_id_cat = torch.cat(op_window_id_list, dim=0)
+        mch_window_id_cat = torch.cat(mch_window_id_list, dim=0)
+        anchor_idx_cat = torch.tensor(anchor_global_idx_list, dtype=torch.long, device=device)
+        edges_pc_cat = torch.cat(edges_pc_list, dim=1) if edges_pc_list else torch.zeros((2, 0), dtype=torch.long, device=device)
+        edges_mc_cat = torch.cat(edges_mc_list, dim=1) if edges_mc_list else torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        action_h = self.window_encoder.forward_batched(
+            op_global=op_global_cat,
+            op_features=op_features_cat,
+            mch_features=mch_features_cat,
+            op_machine_id=op_machine_id_cat,
+            op_window_id=op_window_id_cat,
+            mch_window_id=mch_window_id_cat,
+            anchor_global_idx=anchor_idx_cat,
+            edge_index_pc=edges_pc_cat,
+            edge_index_mc=edges_mc_cat,
+            num_windows=num_windows,
+        )                                                               # [W, H]
+
+        for layer in self.policy:
+            action_h = layer(action_h)
+        scores = self.action_head(action_h).squeeze(-1)                 # [W]
 
         for b in range(batch_size):
-            candidate_windows = batch_window_states[b]
-
-            if len(candidate_windows) == 0:
-                sampled_actions.append(0)
-                log_probs.append(torch.zeros(1, device=batch_states.x.device).squeeze(0))
+            cand_idx = candidates_per_batch[b]
+            if len(cand_idx) == 0:
                 continue
-
-            cand_scores = []
-            cand_actions = []
-
-            for window_state in candidate_windows:
-                action_h = self.window_encoder(global_op_embed[b], window_state)
-
-                for layer in self.policy:
-                    action_h = layer(action_h)
-
-                score = self.action_head(action_h).squeeze(-1)
-
-                cand_scores.append(score)
-                cand_actions.append(window_state["action"])
-
-            cand_scores = torch.stack(cand_scores, dim=0)   # [A]
+            cand_scores = scores[torch.tensor(cand_idx, dtype=torch.long, device=device)]
             dist = Categorical(logits=cand_scores)
             idx = dist.sample()
-
-            sampled_actions.append(cand_actions[idx.item()])
-            log_probs.append(dist.log_prob(idx))
+            sampled_actions[b] = action_per_window[cand_idx[int(idx.item())]]
+            log_probs[b] = dist.log_prob(idx)
 
         log_prob = torch.stack(log_probs, dim=0).unsqueeze(-1)
         return sampled_actions, log_prob

@@ -89,6 +89,27 @@ class JsspWindow:
         self.current_adj_mats = None
         self.last_feasible_actions = None
         self.last_window_states = None
+        # ===== reward shaping state =====
+        # initial_objs:      makespan at reset, used as a per-instance scale.
+        # best_objs:         running best (min) makespan seen so far this episode.
+        # reward_step_cap:   upper bound applied to per-step relative gain.
+        #                    Caps the big "free" early-phase improvements so a
+        #                    single 10% jump doesn't dwarf the credit accumulated
+        #                    by many small late-phase 0.1% improvements.
+        # reward_best_w:     weight on the strictly-positive new-best bonus.
+        # reward_stuck:      small penalty when current makespan didn't improve
+        #                    this step. Pushes the policy to keep finding moves
+        #                    instead of settling once gains get tiny.
+        self.initial_objs = None
+        self.best_objs = None
+        self.reward_step_cap = 0.01     # 1% of current makespan per step
+        self.reward_best_w = 1.0
+        # v4: another 10x bump. At 1e-2 a single stuck step costs as much as
+        # the best capped improving step earns -- only persistently-improving
+        # trajectories can keep return positive. Compared with the v2 run
+        # (1e-4) and v3 run (1e-3) this sets the upper end of the
+        # stagnation-penalty sweep the user asked for.
+        self.reward_stuck = 1e-2
 
     # Create the conjunctions adjacent matrix
     # Return: [batch, n_oprs+2, n_oprs+2]
@@ -440,8 +461,33 @@ class JsspWindow:
             self.instances, self.sub_graphs_mc, device
         )
 
-        reward = (self.current_objs - makespan) / self.current_objs
+        # ===== reward: shaped for *continuous* improvement =====
+        # The environment is monotone non-worse, so naive (prev - new) / prev is
+        # dense early (big easy jumps) and effectively zero late. We want the
+        # opposite credit assignment: reward many small improvements, punish
+        # stagnation.
+        #
+        #   step_rel : relative gain w.r.t. previous makespan, capped at
+        #              reward_step_cap so one huge early jump cannot dwarf a
+        #              long run of tiny late-phase gains.
+        #   best_rel : same shape but only positive when a new best-so-far is
+        #              hit -- a sparse extra signal that "this move actually
+        #              advanced the frontier".
+        #   stuck    : flat per-step penalty when current makespan didn't drop.
+        prev_obj = self.current_objs
+        prev_best = self.best_objs
+        new_best = torch.minimum(prev_best, makespan)
+
+        prev_obj_safe = prev_obj.clamp(min=1.0)
+        prev_best_safe = prev_best.clamp(min=1.0)
+
+        step_rel = ((prev_obj - makespan) / prev_obj_safe).clamp(max=self.reward_step_cap)
+        best_rel = ((prev_best - new_best) / prev_best_safe).clamp(max=self.reward_step_cap)
+        no_improve = (makespan >= prev_obj).to(step_rel.dtype)
+        reward = step_rel + self.reward_best_w * best_rel - self.reward_stuck * no_improve
+
         self.current_objs = makespan
+        self.best_objs = new_best
 
         if self.tabu_size != 0:
             for i, action in enumerate(actions):
@@ -496,6 +542,10 @@ class JsspWindow:
         self.sub_graphs_mc = sub_graphs_mc
         self.current_graphs = current_graphs
         self.current_objs = make_span
+        # Anchor reward scale to the initial schedule and reset the running
+        # best-so-far makespan for this episode.
+        self.initial_objs = make_span.clone()
+        self.best_objs = make_span.clone()
         self.itr = 0
         self.tabu_lists = [[] for _ in range(instances.shape[0])]
 

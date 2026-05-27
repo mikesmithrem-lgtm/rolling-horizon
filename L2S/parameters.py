@@ -18,6 +18,9 @@ parser.add_argument('--drop_out', type=float, default=0.1)  # dghan parameters
 parser.add_argument('--lr', type=float, default=5e-5)
 parser.add_argument('--steps_learn', type=int, default=25)
 parser.add_argument('--transit', type=int, default=500)
+# transit length used only during periodic validation (kept small to bound the
+# 100-instance validation wall-time even when --transit is large)
+parser.add_argument('--validation_transit', type=int, default=0)
 parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--episodes', type=int, default=1)
 parser.add_argument('--step_validation', type=int, default=25)
